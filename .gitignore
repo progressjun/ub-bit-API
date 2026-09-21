@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+config.yaml
+data/*.db
+data/*.json
+data/candles/
+logs/
+.KILL
+.DS_Store
