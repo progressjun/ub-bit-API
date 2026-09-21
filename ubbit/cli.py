@@ -618,6 +618,28 @@ def cmd_simulate(cfg: Config, args: argparse.Namespace) -> int:
     return 0 if all(verdicts) else 3
 
 
+# ----------------------------------------------------------------- smoketest
+def cmd_smoketest(cfg: Config, args: argparse.Namespace) -> int:
+    """최소 금액 실주문으로 LiveBroker 경로를 검증한다.
+
+    이 프로젝트에서 유일하게 테스트로 덮이지 않은 코드가 실주문 응답 파싱이다.
+    5,000원짜리 왕복 한 번으로 그것을 확인한다.
+    """
+    from .smoketest import MAX_AMOUNT, SmokeTestError, run
+
+    if not args.yes_i_know:
+        print("실제 주문이 발생합니다. --yes-i-know 플래그가 필요합니다.")
+        print(f"\n  python -m ubbit -c {args.config} smoketest --yes-i-know")
+        print(f"\n  {args.market} 에 {args.amount:,.0f}원 시장가 매수 후 즉시 매도합니다.")
+        print("  예상 손실은 왕복 비용(약 10~30원)이며, 노출 시간은 수 초입니다.")
+        return 2
+    try:
+        return run(cfg, args.market, args.amount)
+    except SmokeTestError as exc:
+        print(f"\n[중단] {exc}")
+        return 1
+
+
 # -------------------------------------------------------------------- doctor
 def cmd_doctor(cfg: Config, args: argparse.Namespace) -> int:
     print("=" * 74)
@@ -820,6 +842,12 @@ def main(argv: list[str] | None = None) -> int:
     p_sim.add_argument("--min-p-profit", type=float, default=0.60)
     p_sim.add_argument("--max-p-ruin", type=float, default=0.10)
     p_sim.set_defaults(func=cmd_simulate)
+
+    p_smoke = sub.add_parser("smoketest", help="최소 금액 실주문으로 주문 경로 검증")
+    p_smoke.add_argument("--market", default="KRW-BTC")
+    p_smoke.add_argument("--amount", type=float, default=5_000.0)
+    p_smoke.add_argument("--yes-i-know", action="store_true", help="실제 주문 발생 동의")
+    p_smoke.set_defaults(func=cmd_smoketest)
 
     sub.add_parser("doctor", help="키/권한/슬리피지 점검").set_defaults(func=cmd_doctor)
     sub.add_parser("paper", help="가상매매 실행").set_defaults(func=cmd_paper)
