@@ -16,6 +16,7 @@ import sys
 
 from .adapt import ParamStore, evaluate_promotion, walk_forward
 from .backtest import fee_sensitivity, run_backtest
+from .montecarlo import MCParams, simulate_engine, simulate_trades
 from .config import Config, load_config
 from .engine import TradingEngine
 from .fees import CostModel, estimate_slippage_from_orderbook, infer_tick_size
@@ -529,6 +530,94 @@ def cmd_dashboard(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+
+# ------------------------------------------------------------------ simulate
+def cmd_simulate(cfg: Config, args: argparse.Namespace) -> int:
+    """몬테카를로 수익성 시뮬레이션.
+
+    단일 백테스트 수치 대신 결과 분포를 낸다. 답해야 할 질문은
+    '얼마 벌었나'가 아니라 '다시 돌리면 흑자일 확률이 얼마인가'이다.
+    """
+    unit = args.unit or cfg.engine.candle_unit
+    data = _load_market_candles(unit, args.min_bars)
+    if args.markets:
+        data = {m: c for m, c in data.items() if m in set(args.markets)}
+    if not data:
+        print(f"{unit}분봉 캔들 없음. `python scripts/fetch_all.py` 를 먼저 실행하세요.")
+        return 1
+
+    oos = {m: c[args.train_bars:] for m, c in data.items() if len(c) > args.train_bars + 100}
+    print("=" * 84)
+    print(f"몬테카를로 수익성 시뮬레이션 — {unit}분봉, 종목 {len(oos)}개, "
+          f"진입방식 {cfg.strategy.entry_mode}")
+    print(f"초기자본 {cfg.engine.initial_krw:,.0f}원 | {cfg.cost.describe()}")
+    print("=" * 84)
+
+    # 실현 거래 수집
+    trades = []
+    per_market = {}
+    for market, candles in oos.items():
+        bt = run_backtest(market, candles, cost=cfg.cost, sparams=cfg.strategy,
+                          rparams=cfg.risk, initial_krw=cfg.engine.initial_krw)
+        trades.extend(bt.trades)
+        per_market[market] = bt.total_return
+    print(f"\n기준 표본: OOS 거래 {len(trades)}건 / 종목 {len(per_market)}개 "
+          f"({len(oos[list(oos)[0]]) * unit / 1440:.0f}일 구간)")
+    if not trades:
+        print("거래가 없어 시뮬레이션할 수 없습니다.")
+        return 1
+
+    mc1 = simulate_trades(trades, initial_krw=cfg.engine.initial_krw,
+                          params=MCParams(iterations=args.iterations,
+                                          block_size=args.block,
+                                          horizon_trades=args.horizon,
+                                          ruin_drawdown=args.ruin))
+    print()
+    print(mc1.render())
+
+    results = [mc1]
+    if args.synthetic:
+        subset = dict(list(oos.items())[: args.synthetic_markets])
+        print(f"\n합성 경로 {args.synthetic}개 생성 — 종목 {len(subset)}개, "
+              f"블록 {args.synthetic_block}봉. 경로마다 엔진을 처음부터 재실행합니다.")
+
+        def _tick(done, total):
+            print(f"\r  {done}/{total}", end="", flush=True)
+
+        mc2 = simulate_engine(subset, cfg, iterations=args.synthetic,
+                              block=args.synthetic_block, ruin_drawdown=args.ruin,
+                              progress=_tick)
+        print()
+        print()
+        print(mc2.render())
+        results.append(mc2)
+
+    print("\n" + "=" * 84)
+    print("판정")
+    print("=" * 84)
+    verdicts = []
+    for mc in results:
+        ok = mc.p_profit >= args.min_p_profit and mc.p_ruin <= args.max_p_ruin
+        if mc.p_beat_benchmark is not None and mc.p_beat_benchmark < 0.5:
+            ok = False
+        verdicts.append(ok)
+        mark = "통과" if ok else "미달"
+        extra = ("" if mc.p_beat_benchmark is None
+                 else f" / 단순보유 우위 확률 {mc.p_beat_benchmark*100:.1f}% (기준 50%)")
+        print(f"  [{mark}] {mc.label}: 흑자확률 {mc.p_profit*100:.1f}% "
+              f"(기준 {args.min_p_profit*100:.0f}%) / "
+              f"-{int(args.ruin*100)}% 낙폭 확률 {mc.p_ruin*100:.1f}% "
+              f"(기준 {args.max_p_ruin*100:.0f}% 이하){extra}")
+    if all(verdicts):
+        print("\n모든 시뮬레이션이 기준을 통과했다. 다만 이것은 '과거 분포가 유지될 때'의")
+        print("조건부 결론이다. 국면이 바뀌면 분포가 먼저 바뀐다.")
+    else:
+        print("\n기준 미달. 이 자본 비중과 이 전략 조합으로는 기대 수익보다 변동이 크다.")
+        print("사이즈(risk_per_trade, max_position_pct)를 낮추면 분포가 좁아진다.")
+    print("=" * 84)
+    return 0 if all(verdicts) else 3
+
+
 # -------------------------------------------------------------------- doctor
 def cmd_doctor(cfg: Config, args: argparse.Namespace) -> int:
     print("=" * 74)
@@ -715,6 +804,22 @@ def main(argv: list[str] | None = None) -> int:
     p_db.add_argument("--port", type=int, default=8777)
     p_db.add_argument("--no-browser", action="store_true")
     p_db.set_defaults(func=cmd_dashboard)
+
+    p_sim = sub.add_parser("simulate", help="몬테카를로 수익성 시뮬레이션")
+    p_sim.add_argument("--markets", nargs="*", default=None)
+    p_sim.add_argument("--unit", type=int, default=None)
+    p_sim.add_argument("--train-bars", type=int, default=1200, help="설계 구간으로 제외할 앞부분")
+    p_sim.add_argument("--min-bars", type=int, default=2000)
+    p_sim.add_argument("--iterations", type=int, default=10000, help="거래 재표집 경로 수")
+    p_sim.add_argument("--block", type=int, default=5, help="거래 블록 크기 (연속 손익 보존)")
+    p_sim.add_argument("--horizon", type=int, default=0, help="경로당 거래 수 (0=표본과 동일)")
+    p_sim.add_argument("--synthetic", type=int, default=0, help="합성 시장 경로 수 (0=생략)")
+    p_sim.add_argument("--synthetic-markets", type=int, default=6)
+    p_sim.add_argument("--synthetic-block", type=int, default=20, help="가격 블록 봉 수")
+    p_sim.add_argument("--ruin", type=float, default=0.30, help="사실상 중단으로 볼 낙폭")
+    p_sim.add_argument("--min-p-profit", type=float, default=0.60)
+    p_sim.add_argument("--max-p-ruin", type=float, default=0.10)
+    p_sim.set_defaults(func=cmd_simulate)
 
     sub.add_parser("doctor", help="키/권한/슬리피지 점검").set_defaults(func=cmd_doctor)
     sub.add_parser("paper", help="가상매매 실행").set_defaults(func=cmd_paper)

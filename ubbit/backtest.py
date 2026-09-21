@@ -34,6 +34,7 @@ class BTTrade:
     net_return: float
     bars: int
     exit_kind: str
+    equity_at_entry: float = 0.0   # 진입 시점 자본. 몬테카를로에서 베팅 비중 복원용
 
 
 @dataclass
@@ -131,6 +132,7 @@ def run_backtest(
     entry_krw = 0.0
     entry_ts = ""
     entry_bar = 0
+    entry_equity = initial_krw
     pending: tuple[str, dict] | None = None   # 다음 봉 시가에 체결할 주문
 
     for i in range(len(candles)):
@@ -147,6 +149,7 @@ def run_backtest(
                     entry_krw = meta["krw"]
                     entry_ts = candle.ts
                     entry_bar = i
+                    entry_equity = meta["equity"]
                     position = PositionView(
                         market=market, entry_price=fill_price, qty=qty,
                         stop_price=fill_price - meta["atr"] * sparams.stop_atr,
@@ -166,6 +169,7 @@ def run_backtest(
                     fee=entry_fee + fee, net_pnl=net_pnl,
                     net_return=net_pnl / entry_krw if entry_krw else 0.0,
                     bars=i - entry_bar, exit_kind=meta.get("exit_kind", "unknown"),
+                    equity_at_entry=entry_equity,
                 ))
                 risk.record_exit(market, net_pnl, now=_fake_now(candle.ts))
                 position = None
@@ -213,6 +217,7 @@ def run_backtest(
             "krw": size,
             "atr": sig.snapshot.atr or 0.0,
             "target_net": sig.meta["target_net"],
+            "equity": equity,
         })
 
     return result
