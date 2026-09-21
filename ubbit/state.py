@@ -163,10 +163,16 @@ class Store:
         self.conn.commit()
 
     # ---------------------------------------------------------------- equity
-    def record_equity(self, total: float, cash: float, exposure: float) -> None:
+    def record_equity(self, total: float, cash: float, exposure: float,
+                      ts: datetime | None = None) -> None:
+        """자산 스냅샷. ts 는 엔진 시계를 받는다.
+
+        datetime.now() 를 직접 쓰면 replay 처럼 한 초 안에 여러 틱이 도는 경우
+        같은 기본키로 덮어써져 곡선이 몇 점만 남는다.
+        """
         self.conn.execute(
             "INSERT OR REPLACE INTO equity (ts,total_krw,cash_krw,exposure_krw) VALUES (?,?,?,?)",
-            (datetime.now().isoformat(timespec="seconds"), total, cash, exposure),
+            ((ts or datetime.now()).isoformat(timespec="seconds"), total, cash, exposure),
         )
         self.conn.commit()
 

@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ubbit 운용 현황</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%233b5bdb'/%3E%3Cpath d='M3 11l3-4 3 2 4-6' stroke='white' stroke-width='1.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<style>
+:root{
+  --bg:#f6f7f9; --panel:#ffffff; --line:#e3e6ea; --ink:#16191d; --muted:#6b7280;
+  --up:#c8372d; --down:#1859c4; --flat:#6b7280; --accent:#3b5bdb; --warn:#b45309;
+  --shadow:0 1px 2px rgba(16,19,23,.06),0 4px 12px rgba(16,19,23,.04);
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --bg:#0f1115; --panel:#171a20; --line:#272c34; --ink:#e8eaed; --muted:#9aa3af;
+    --up:#ff6b5e; --down:#5b8dff; --flat:#9aa3af; --accent:#7c93f5; --warn:#f0b429;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 4px 16px rgba(0,0,0,.3);
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0f1115; --panel:#171a20; --line:#272c34; --ink:#e8eaed; --muted:#9aa3af;
+  --up:#ff6b5e; --down:#5b8dff; --flat:#9aa3af; --accent:#7c93f5; --warn:#f0b429;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 4px 16px rgba(0,0,0,.3);
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font-family:-apple-system,BlinkMacSystemFont,"Pretendard","Apple SD Gothic Neo",
+    "Malgun Gothic",Segoe UI,Roboto,sans-serif;
+  font-size:14px;line-height:1.55;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1180px;margin:0 auto;padding:20px 16px 64px}
+h1{font-size:19px;margin:0;letter-spacing:-.01em}
+h2{font-size:13px;margin:0 0 12px;color:var(--muted);font-weight:600;
+  letter-spacing:.04em;text-transform:uppercase}
+.mono{font-variant-numeric:tabular-nums;
+  font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace}
+
+header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px}
+.badge{font-size:11px;font-weight:700;padding:3px 9px;border-radius:99px;
+  border:1px solid var(--line);color:var(--muted);letter-spacing:.03em}
+.badge.live{background:var(--up);border-color:var(--up);color:#fff}
+.badge.paper{background:var(--accent);border-color:var(--accent);color:#fff}
+.badge.kill{background:var(--warn);border-color:var(--warn);color:#000}
+.spacer{flex:1}
+button{font:inherit;cursor:pointer;border:1px solid var(--line);background:var(--panel);
+  color:var(--ink);border-radius:8px;padding:6px 12px;transition:.12s}
+button:hover{border-color:var(--accent)}
+button.danger{border-color:var(--warn);color:var(--warn);font-weight:600}
+button.danger:hover{background:var(--warn);color:#000}
+
+.grid{display:grid;gap:12px;margin-bottom:12px}
+/* 그리드 자식의 기본 min-width:auto 가 표를 뷰포트 밖으로 밀어낸다 */
+.grid > *{min-width:0}
+.g4{grid-template-columns:repeat(4,1fr)}
+.g2{grid-template-columns:2fr 1fr}
+@media(max-width:860px){.g4{grid-template-columns:repeat(2,1fr)}.g2{grid-template-columns:1fr}}
+@media(max-width:480px){.g4{grid-template-columns:1fr}}
+
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  padding:16px;box-shadow:var(--shadow);min-width:0}
+.tile .label{font-size:12px;color:var(--muted);margin-bottom:6px}
+.tile .value{font-size:24px;font-weight:700;letter-spacing:-.02em}
+.tile .sub{font-size:12px;color:var(--muted);margin-top:4px}
+.up{color:var(--up)} .down{color:var(--down)} .flat{color:var(--flat)}
+
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:right;font-weight:600;color:var(--muted);font-size:11px;
+  letter-spacing:.03em;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+td{padding:7px 8px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}
+tbody tr:last-child td{border-bottom:none}
+.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.scroll.cap{max-height:420px;overflow-y:auto}
+.scroll.cap thead th{position:sticky;top:0;background:var(--panel);z-index:1}
+.tag{font-size:11px;padding:2px 7px;border-radius:5px;border:1px solid var(--line);
+  color:var(--muted)}
+.bar{height:5px;border-radius:99px;background:var(--line);overflow:hidden;margin-top:6px}
+.bar > i{display:block;height:100%;border-radius:99px;background:var(--accent)}
+.bar > i.warn{background:var(--warn)}
+.kv{display:flex;justify-content:space-between;gap:12px;padding:5px 0;
+  border-bottom:1px dashed var(--line)}
+.kv:last-child{border-bottom:none}
+.kv span:first-child{color:var(--muted)}
+.empty{color:var(--muted);text-align:center;padding:28px 0}
+.note{font-size:12px;color:var(--muted);margin-top:10px;line-height:1.6}
+svg{display:block;width:100%;height:auto}
+.dot{width:7px;height:7px;border-radius:99px;display:inline-block;margin-right:6px}
+.dot.on{background:#16a34a} .dot.off{background:var(--muted)} .dot.warn{background:var(--warn)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>ubbit 운용 현황</h1>
+    <span class="badge" id="modeBadge">—</span>
+    <span class="badge" id="killBadge" hidden>킬스위치 작동중</span>
+    <span class="spacer"></span>
+    <span class="mono" id="stamp" style="color:var(--muted);font-size:12px"></span>
+    <button id="killBtn" class="danger">긴급 정지</button>
+    <button id="themeBtn">테마</button>
+  </header>
+
+  <div id="notReady" class="card empty" hidden></div>
+
+  <main id="main" hidden>
+    <div class="grid g4">
+      <div class="card tile">
+        <div class="label">총 자산</div>
+        <div class="value mono" id="tEquity">—</div>
+        <div class="sub mono" id="tEquitySub">—</div>
+      </div>
+      <div class="card tile">
+        <div class="label">현금 / 투입</div>
+        <div class="value mono" id="tCash">—</div>
+        <div class="sub mono" id="tCashSub">—</div>
+      </div>
+      <div class="card tile">
+        <div class="label">현재 낙폭 (고점 대비)</div>
+        <div class="value mono" id="tDd">—</div>
+        <div class="sub mono" id="tDdSub">—</div>
+      </div>
+      <div class="card tile">
+        <div class="label">오늘 회전 / 비용</div>
+        <div class="value mono" id="tTurn">—</div>
+        <div class="sub mono" id="tTurnSub">—</div>
+        <div class="bar"><i id="turnBar" style="width:0%"></i></div>
+      </div>
+    </div>
+
+    <div class="grid g2">
+      <div class="card">
+        <h2>자산 곡선</h2>
+        <div id="chart"></div>
+        <div class="note" id="chartNote"></div>
+      </div>
+      <div class="card">
+        <h2>비용 구조</h2>
+        <div id="costBox"></div>
+        <div class="note">
+          손익분기는 매도가가 매수가 대비 이만큼 올라야 손익 0이 되는 비율이다.
+          진입 변동성 하한 아래 구간에서는 봇이 매매하지 않는다.
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:12px">
+      <h2>보유 포지션 <span id="posCount" class="tag"></span></h2>
+      <div class="scroll"><table>
+        <thead><tr>
+          <th>종목</th><th>진입가</th><th>현재가</th><th>순손익</th><th>평가손익</th>
+          <th>손절까지</th><th>목표순익</th><th>보유</th><th>트레일링</th>
+        </tr></thead>
+        <tbody id="posBody"></tbody>
+      </table></div>
+      <div class="note">
+        순손익은 수수료와 슬리피지를 차감한 값이다. 화면의 수익률이 0%여도
+        실제로는 왕복 비용만큼 손실 상태다.
+      </div>
+    </div>
+
+    <div class="grid g2">
+      <div class="card">
+        <h2>최근 체결</h2>
+        <div class="scroll cap"><table>
+          <thead><tr><th>종목</th><th>청산시각</th><th>순수익률</th><th>손익</th><th>사유</th></tr></thead>
+          <tbody id="tradeBody"></tbody>
+        </table></div>
+        <div class="note" id="tradeNote"></div>
+      </div>
+      <div class="card">
+        <h2>누적 성과</h2>
+        <div id="perfBox"></div>
+        <h2 style="margin-top:18px">청산 사유 분포</h2>
+        <div id="exitBox"></div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const won = (v, d = 0) => (v == null ? '—' :
+  v.toLocaleString('ko-KR', {minimumFractionDigits: d, maximumFractionDigits: d}));
+const pct = (v, d = 2) => (v == null ? '—' : (v * 100).toFixed(d) + '%');
+const signed = (v, d = 2) => (v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(d) + '%');
+// 한국 관행: 상승 빨강, 하락 파랑
+const cls = v => v > 0 ? 'up' : (v < 0 ? 'down' : 'flat');
+
+let state = null;
+
+function renderChart(curve, initial) {
+  const box = $('chart');
+  if (!curve || curve.length < 2) {
+    box.innerHTML = '<div class="empty">데이터가 쌓이면 곡선이 그려집니다</div>';
+    $('chartNote').textContent = '';
+    return;
+  }
+  const W = 640, H = 200, P = 6;
+  const vals = curve.map(c => c.total_krw);
+  const lo = Math.min(...vals, initial), hi = Math.max(...vals, initial);
+  const span = (hi - lo) || 1;
+  const x = i => P + i * (W - 2 * P) / (curve.length - 1);
+  const y = v => H - P - (v - lo) / span * (H - 2 * P);
+  const line = vals.map((v, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join('');
+  const area = `${line}L${x(vals.length - 1).toFixed(1)},${H - P}L${x(0).toFixed(1)},${H - P}Z`;
+  const last = vals[vals.length - 1];
+  const stroke = last >= initial ? 'var(--up)' : 'var(--down)';
+  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img"
+      aria-label="자산 곡선, 최종 ${won(last)}원">
+    <defs><linearGradient id="fade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="${stroke}" stop-opacity=".16"/>
+      <stop offset="1" stop-color="${stroke}" stop-opacity="0"/>
+    </linearGradient></defs>
+    <line x1="${P}" x2="${W - P}" y1="${y(initial).toFixed(1)}" y2="${y(initial).toFixed(1)}"
+      stroke="var(--line)" stroke-dasharray="3 3"/>
+    <path d="${area}" fill="url(#fade)"/>
+    <path d="${line}" fill="none" stroke="${stroke}" stroke-width="1.8"
+      stroke-linejoin="round" stroke-linecap="round"/>
+  </svg>`;
+  $('chartNote').textContent =
+    `${curve[0].ts.slice(0, 16).replace('T', ' ')} ~ ${curve[curve.length - 1].ts.slice(0, 16).replace('T', ' ')}`
+    + ` · ${curve.length}개 기록 · 점선은 시작 자산`;
+}
+
+function kv(rows) {
+  return rows.map(([k, v, c]) =>
+    `<div class="kv"><span>${k}</span><span class="mono ${c || ''}">${v}</span></div>`).join('');
+}
+
+function render(s) {
+  state = s;
+  if (!s.ready) {
+    $('main').hidden = true;
+    $('notReady').hidden = false;
+    $('notReady').innerHTML =
+      `${s.message || '데이터 없음'}<br><span class="mono" style="font-size:12px">${s.db_path || ''}</span>`;
+    return;
+  }
+  $('notReady').hidden = true;
+  $('main').hidden = false;
+
+  const badge = $('modeBadge');
+  badge.textContent = s.mode === 'live' ? '실거래' : '페이퍼';
+  badge.className = 'badge ' + (s.mode === 'live' ? 'live' : 'paper');
+  $('killBadge').hidden = !s.kill;
+  $('killBadge').className = 'badge kill';
+  $('killBtn').textContent = s.kill ? '정지 해제' : '긴급 정지';
+
+  const age = s.engine.seconds_since_update;
+  const fresh = age != null && age < Math.max(s.engine.poll_seconds * 3, 120);
+  const dot = age == null ? 'off' : (fresh ? 'on' : 'warn');
+  const label = age == null ? '기록 없음'
+    : (fresh ? '엔진 가동중' : `${Math.round(age / 60)}분간 갱신 없음`);
+  $('stamp').innerHTML = `<span class="dot ${dot}"></span>${label}`
+    + ` · ${s.engine.candle_unit}분봉 · ${s.engine.entry_mode}`
+    + ` · ${s.engine.universe_auto ? '종목 자동선별' : (s.engine.markets.join(', ') || '—')}`;
+
+  const e = s.equity;
+  const ret = e.initial ? e.total / e.initial - 1 : 0;
+  $('tEquity').textContent = won(e.total) + '원';
+  $('tEquity').className = 'value mono ' + cls(ret);
+  $('tEquitySub').textContent = `시작 ${won(e.initial)}원 · ${signed(ret)}`;
+
+  $('tCash').textContent = won(e.cash) + '원';
+  $('tCashSub').textContent = `투입 ${won(e.exposure)}원 · 비중 `
+    + pct(e.total ? e.exposure / e.total : 0, 1);
+
+  $('tDd').textContent = signed(e.drawdown);
+  $('tDd').className = 'value mono ' + (e.drawdown < -0.001 ? 'down' : 'flat');
+  $('tDdSub').textContent = `고점 ${won(e.peak)}원`;
+
+  const t = s.today, lim = s.risk.daily_trade_limit;
+  $('tTurn').textContent = `${t.trades} / ${lim}회`;
+  $('tTurnSub').textContent = `확정 비용 -${pct(t.drag)} · 오늘 손익 ${won(t.pnl)}원`;
+  const ratio = Math.min(lim ? t.trades / lim : 0, 1);
+  $('turnBar').style.width = (ratio * 100).toFixed(0) + '%';
+  $('turnBar').className = ratio >= 1 ? 'warn' : '';
+
+  const c = s.cost;
+  $('costBox').innerHTML = kv([
+    ['수수료 (매수/매도)', pct(c.fee_buy, 3) + ' / ' + pct(c.fee_sell, 3)],
+    ['슬리피지 가정', pct(c.slippage_buy, 3) + ' / ' + pct(c.slippage_sell, 3)],
+    ['<b>왕복 손익분기</b>', '<b>' + pct(c.breakeven, 4) + '</b>'],
+    ['수수료만 손익분기', pct(c.fee_only, 4)],
+    ['진입 변동성 하한 (ATR%)', pct(c.atr_floor, 3)],
+    ['목표 순익 하한', pct(c.min_net_target, 3)],
+    [`일 ${s.risk.daily_trade_limit}회전 확정 비용`, '-' + pct(c.drag_at_limit),
+      c.drag_at_limit > s.risk.daily_loss_limit ? 'up' : ''],
+    ['일일 손실한도', '-' + pct(s.risk.daily_loss_limit, 1)],
+    ['1회 최대 주문', won(s.risk.max_order_krw) + '원'],
+  ]);
+
+  const pb = $('posBody');
+  $('posCount').textContent = `${s.positions.length} / ${s.risk.max_concurrent}`;
+  pb.innerHTML = s.positions.length ? s.positions.map(p => `
+    <tr>
+      <td><b>${p.market}</b></td>
+      <td class="mono">${won(p.entry_price, 2)}</td>
+      <td class="mono">${won(p.price, 2)}</td>
+      <td class="mono ${cls(p.net_return)}"><b>${signed(p.net_return, 3)}</b></td>
+      <td class="mono ${cls(p.net_pnl)}">${won(p.net_pnl)}</td>
+      <td class="mono">${signed(-p.stop_gap, 2)}</td>
+      <td class="mono">${pct(p.target_net, 2)}</td>
+      <td class="mono">${p.bars_held}봉</td>
+      <td><span class="tag">${p.armed ? '활성' : '대기'}</span></td>
+    </tr>`).join('')
+    : `<tr><td colspan="9" class="empty">보유 포지션 없음</td></tr>`;
+
+  const p0 = s.performance;
+  const tb = $('tradeBody');
+  tb.innerHTML = s.trades.length ? s.trades.map(t => `
+    <tr>
+      <td><b>${t.market}</b></td>
+      <td class="mono" style="color:var(--muted)">${t.closed_at.slice(5, 16).replace('T', ' ')}</td>
+      <td class="mono ${cls(t.net_return)}">${signed(t.net_return, 3)}</td>
+      <td class="mono ${cls(t.net_pnl)}">${won(t.net_pnl)}</td>
+      <td><span class="tag">${t.exit_kind}</span></td>
+    </tr>`).join('')
+    : `<tr><td colspan="5" class="empty">체결 없음</td></tr>`;
+  $('tradeNote').textContent = s.trades.length
+    ? `최근 ${s.trades.length}건 표시 · 누적 ${p0.trades}건 (스크롤)` : '';
+
+  const enough = p0.trades >= 50;
+  $('perfBox').innerHTML = kv([
+    ['누적 거래', p0.trades + '건'],
+    ['순손익', won(p0.net_pnl) + '원', cls(p0.net_pnl)],
+    ['승률', pct(p0.win_rate, 1)],
+    ['손익비 (PF)', p0.profit_factor == null ? '—' : p0.profit_factor.toFixed(2)],
+    ['지불 수수료', won(p0.fees_paid) + '원'],
+    ['수수료 / 손익 절대값', p0.fee_to_pnl == null ? '—' : pct(p0.fee_to_pnl, 0)],
+    ['통계적 판단 가능', enough ? '충족 (50건 이상)' : `미달 (${p0.trades}/50건)`,
+      enough ? '' : 'flat'],
+  ]);
+
+  const mix = Object.entries(s.exit_mix).sort((a, b) => b[1] - a[1]);
+  const total = mix.reduce((a, b) => a + b[1], 0) || 1;
+  $('exitBox').innerHTML = mix.length ? mix.map(([k, v]) => `
+    <div class="kv"><span>${k}</span><span class="mono">${v}건 · ${pct(v / total, 0)}</span></div>
+    <div class="bar"><i style="width:${(v / total * 100).toFixed(0)}%"></i></div>`).join('')
+    : '<div class="empty">체결 없음</div>';
+
+  renderChart(s.curve, e.initial);
+}
+
+async function refresh() {
+  try {
+    const res = await fetch('/api/state', {cache: 'no-store'});
+    render(await res.json());
+  } catch (err) {
+    $('stamp').innerHTML = '<span class="dot warn"></span>서버 연결 끊김';
+  }
+}
+
+$('killBtn').addEventListener('click', async () => {
+  if (!state) return;
+  const engage = !state.kill;
+  const msg = engage
+    ? '긴급 정지합니다.\n\n신규 진입이 즉시 차단됩니다.\n보유 포지션의 손절·익절은 계속 동작합니다.'
+    : '정지를 해제합니다. 신규 진입이 다시 허용됩니다.';
+  if (!confirm(msg)) return;
+  await fetch('/api/kill', {method: 'POST', body: JSON.stringify({engage})});
+  refresh();
+});
+
+$('themeBtn').addEventListener('click', () => {
+  const now = document.documentElement.getAttribute('data-theme');
+  const next = now === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  try { localStorage.setItem('ubbit-theme', next); } catch (e) {}
+});
+try {
+  const saved = localStorage.getItem('ubbit-theme');
+  if (saved) document.documentElement.setAttribute('data-theme', saved);
+} catch (e) {}
+
+refresh();
+setInterval(refresh, 4000);
+</script>
+</body>
+</html>

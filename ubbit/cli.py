@@ -518,6 +518,17 @@ def cmd_replay(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+
+# ----------------------------------------------------------------- dashboard
+def cmd_dashboard(cfg: Config, args: argparse.Namespace) -> int:
+    """브라우저 대시보드. 봇과 별도 프로세스로 띄워 DB 를 읽기만 한다."""
+    from .dashboard import serve
+
+    serve(cfg, args.db or cfg.engine.db_path, args.host, args.port,
+          open_browser=not args.no_browser)
+    return 0
+
+
 # -------------------------------------------------------------------- doctor
 def cmd_doctor(cfg: Config, args: argparse.Namespace) -> int:
     print("=" * 74)
@@ -680,6 +691,13 @@ def main(argv: list[str] | None = None) -> int:
     p_rp.add_argument("--db", default="data/replay.db")
     p_rp.add_argument("--keep", action="store_true", help="기존 DB 유지(이어서 재생)")
     p_rp.set_defaults(func=cmd_replay)
+
+    p_db = sub.add_parser("dashboard", help="브라우저 대시보드 실행")
+    p_db.add_argument("--db", default=None, help="DB 경로 (예: data/replay.db)")
+    p_db.add_argument("--host", default="127.0.0.1")
+    p_db.add_argument("--port", type=int, default=8777)
+    p_db.add_argument("--no-browser", action="store_true")
+    p_db.set_defaults(func=cmd_dashboard)
 
     sub.add_parser("doctor", help="키/권한/슬리피지 점검").set_defaults(func=cmd_doctor)
     sub.add_parser("paper", help="가상매매 실행").set_defaults(func=cmd_paper)

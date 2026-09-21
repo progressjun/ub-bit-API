@@ -134,7 +134,8 @@ python -m ubbit backtest KRW-DOGE --unit 15 --trades
 python -m ubbit validate --units 60 240 --modes breakout   # 엣지 통계 검증
 python -m ubbit replay --unit 240          # 엔진 고속 재생 (주문 없음)
 python -m ubbit optimize --markets KRW-DOGE --unit 60   # 워크포워드 재적합
-python -m ubbit status --db data/replay.db # 포지션·누적 성과
+python -m ubbit dashboard --db data/replay.db  # 브라우저 대시보드
+python -m ubbit status --db data/replay.db # 포지션·누적 성과 (터미널)
 python -m ubbit doctor                     # 키/권한/실측 슬리피지 점검
 python -m ubbit paper                      # 가상매매 (실주문 없음)
 python -m ubbit live --yes-i-know          # 실주문
@@ -146,15 +147,41 @@ python -m ubbit live --yes-i-know          # 실주문
 pip install -r requirements.txt
 python scripts/fetch_all.py 24                          # 캔들 수집 (~5분)
 python -m ubbit -c config.proven.yaml replay --unit 240 # 엔진 재생, 수 초
-python -m ubbit -c config.proven.yaml status --db data/replay.db
+python -m ubbit -c config.proven.yaml dashboard --db data/replay.db
 ```
 
-재생이 끝나면 실시간 페이퍼로 넘어간다.
+마지막 줄이 브라우저를 열고 http://127.0.0.1:8777 에 화면을 띄운다.
+
+재생이 끝나면 실시간 페이퍼로 넘어간다. 터미널 두 개를 쓴다.
 
 ```bash
-python -m ubbit -c config.proven.yaml paper
-touch .KILL      # 다른 터미널에서 — 즉시 신규 진입 차단
+python -m ubbit -c config.proven.yaml paper          # 터미널 1: 봇
+python -m ubbit -c config.proven.yaml dashboard      # 터미널 2: 화면
 ```
+
+## 대시보드
+
+`python -m ubbit dashboard` 로 띄운다. 표준 라이브러리 `http.server` 만 쓰고
+외부 CDN 을 로드하지 않으므로 오프라인·사내망에서도 그대로 뜬다.
+기본 바인딩은 `127.0.0.1` 이다. **잔고와 포지션이 노출되므로 외부에 열지 말 것.**
+
+화면에 나오는 것:
+
+- 총 자산, 현금/투입 비중, 고점 대비 낙폭
+- **오늘 회전수와 그 확정 비용** — 회전이 늘수록 막대가 차오른다
+- 자산 곡선 (인라인 SVG, 점선은 시작 자산)
+- **비용 구조 패널** — 왕복 손익분기, 진입 변동성 하한, 일일 회전 비용
+- 보유 포지션: 순손익(비용 차감 후), 손절까지 남은 거리, 목표 순익, 트레일링 활성 여부
+- 최근 체결과 청산 사유 분포 (stop / take_profit / trail 비중)
+- 누적 성과와 **통계적 판단 가능 여부** (거래 50건 기준)
+- **긴급 정지 버튼** — 누르면 `.KILL` 파일을 만들어 신규 진입을 즉시 차단한다.
+  보유 포지션의 손절·익절은 계속 동작한다.
+
+`● 엔진 가동중` 표시는 최근 자산 기록 시각으로 판단한다. 봇이 죽으면
+`N분간 갱신 없음` 으로 바뀐다. 대시보드는 DB 를 읽기만 하므로 봇과
+별도로 띄우고 껐다 켜도 안전하다.
+
+옵션: `--db <경로>` `--host` `--port`(기본 8777) `--no-browser`
 
 권장 순서: `costs` → `scan` → `universe` → `fetch_all` → `validate` → `replay`
 → `doctor` → `paper`(8주+) → `live`(소액)
@@ -174,6 +201,8 @@ ubbit/
   adapt.py      워크포워드 재적합 + 승격 게이트
   validate.py   부트스트랩 CI + 순열검정 + 베타 검증
   replay.py     과거 캔들로 엔진 고속 재생
+  dashboard.py  로컬 웹 대시보드 (표준 라이브러리만)
+  web/          대시보드 페이지
   broker.py     Paper / Live (동일 인터페이스)
   state.py      SQLite 영속화 (재기동 시 포지션 복원)
   engine.py     메인 루프
@@ -266,7 +295,7 @@ ubbit/
 - [ ] `.KILL` 파일 생성으로 즉시 정지되는지 실제로 테스트
 
 ```bash
-python -m unittest discover -s tests -t .     # 102 tests
+python -m unittest discover -s tests -t .     # 112 tests
 ```
 
 ---

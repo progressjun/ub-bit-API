@@ -7,7 +7,7 @@ replay 의 존재 이유는 '백테스터가 아니라 엔진 자체'를 돌리�
 import os
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from ubbit.config import Config, EngineParams
 from ubbit.engine import TradingEngine
@@ -30,11 +30,13 @@ def series(n=400, start=100.0):
     return prices
 
 
-def candles(prices, span=0.004):
+def candles(prices, span=0.004, unit_minutes=240):
+    """240분봉 시계열. 타임스탬프는 반드시 단조 증가해야 한다 —
+    중복되면 자산 곡선이 같은 기본키로 덮어써진다."""
+    base = datetime(2026, 1, 1, 0, 0)
     out = []
     for i, p in enumerate(prices):
-        ts = datetime(2026, 1, 1, 0, 0) .replace(day=1 + (i * 4) // 24 % 28,
-                                                 hour=(i * 4) % 24)
+        ts = base + timedelta(minutes=unit_minutes * i)
         out.append(Candle(ts=ts.isoformat(), open=p, high=p * (1 + span),
                           low=p * (1 - span), close=p, volume=1000.0,
                           value=1_000_000_000.0 * (2.0 if i % 80 >= 50 else 1.0)))
@@ -129,3 +131,46 @@ class TestRunReplay(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEquityCurve(unittest.TestCase):
+    """자산 곡선이 캔들 시각으로 기록되는지 확인.
+
+    실제 버그였다: record_equity 가 datetime.now() 를 초 단위 기본키로 써서
+    재생 중 수백 틱이 같은 키로 덮어써지고 곡선이 몇 점만 남았다.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.data = {f"KRW-{c}": candles(series(start=100.0 + i * 7))
+                     for i, c in enumerate("AB")}
+        self.cfg = Config(
+            mode="paper",
+            engine=EngineParams(markets=list(self.data), candle_unit=240,
+                                candle_count=200, initial_krw=10_000_000,
+                                db_path=os.path.join(self.tmp, "e.db"),
+                                kill_switch_file=os.path.join(self.tmp, ".KILL"),
+                                liquidity_min_value_krw=0.0),
+            cost=CostModel(), strategy=StrategyParams(warmup_bars=80),
+            risk=RiskParams(max_order_krw=3_000_000),
+            session=SessionParams(enabled=False),
+        )
+
+    def test_curve_has_one_point_per_bar(self):
+        engine = TradingEngine(self.cfg)
+        start = 90
+        run_replay(engine, self.data, start_at=start)
+        rows = engine.store.conn.execute("SELECT COUNT(*) n FROM equity").fetchone()["n"]
+        bars = max(len(c) for c in self.data.values()) - start + 1
+        self.assertGreater(rows, bars * 0.8,
+                           f"곡선 {rows}점 / 재생 {bars}봉 — 타임스탬프가 뭉개졌다")
+        engine.store.close()
+
+    def test_curve_timestamps_are_candle_times(self):
+        engine = TradingEngine(self.cfg)
+        run_replay(engine, self.data, start_at=90)
+        first = engine.store.conn.execute(
+            "SELECT ts FROM equity ORDER BY ts LIMIT 1").fetchone()["ts"]
+        self.assertTrue(first.startswith("2026-01"),
+                        f"캔들 시각이 아니라 실제 시각이 기록됨: {first}")
+        engine.store.close()

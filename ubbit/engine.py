@@ -168,7 +168,7 @@ class TradingEngine:
         now = self.clock()
         total, cash, exposure = self.broker.equity(prices)
         self.risk.roll_day(total, now)
-        self.store.record_equity(total, cash, exposure)
+        self.store.record_equity(total, cash, exposure, now)
 
         # 1) 장 마감 강제 청산 — 손익과 무관하게 실행한다.
         #    포지션을 들고 자면 손절폭이 갭으로 건너뛰어 설계된 손실 한도가 무너진다.
