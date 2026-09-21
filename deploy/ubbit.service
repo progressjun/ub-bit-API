@@ -1,0 +1,39 @@
+# systemd 유닛. 프로세스가 죽으면 손절 주문이 나가지 않는다.
+# 자동매매에서 가장 흔한 실제 손실 경로는 전략 오류가 아니라 프로세스 중단이다.
+#
+# 설치:
+#   sudo cp deploy/ubbit.service /etc/systemd/system/
+#   sudo systemctl edit ubbit          # 아래 환경변수를 여기에 넣는다
+#   sudo systemctl daemon-reload && sudo systemctl enable --now ubbit
+#   journalctl -u ubbit -f             # 로그
+#
+# 키는 유닛 파일이 아니라 드롭인 또는 EnvironmentFile 에 둔다.
+# 유닛 파일은 /etc 에 평문으로 남고 백업에 섞이기 쉽다.
+
+[Unit]
+Description=ubbit 업비트 자동매매
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/opt/ubbit
+EnvironmentFile=/etc/ubbit.env
+ExecStart=/usr/bin/python3 -m ubbit -c config.proven.yaml live --yes-i-know
+
+Restart=always
+RestartSec=15
+# 재시작 폭주 방지: 10분 안에 5회 넘게 죽으면 멈추고 사람을 부른다.
+# 무한 재시작은 같은 주문을 반복 시도해 상황을 악화시킨다.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/ubbit/data /opt/ubbit/logs
+
+[Install]
+WantedBy=multi-user.target

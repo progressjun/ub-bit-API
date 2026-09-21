@@ -202,7 +202,10 @@ ubbit/
   validate.py   부트스트랩 CI + 순열검정 + 베타 검증
   replay.py     과거 캔들로 엔진 고속 재생
   dashboard.py  로컬 웹 대시보드 (표준 라이브러리만)
+  reconcile.py  재기동 시 거래소 잔고 대조
+  notify.py     웹훅 알림 (Slack/Discord)
   web/          대시보드 페이지
+deploy/         systemd 유닛 + 감시 루프 스크립트
   broker.py     Paper / Live (동일 인터페이스)
   state.py      SQLite 영속화 (재기동 시 포지션 복원)
   engine.py     메인 루프
@@ -284,6 +287,55 @@ ubbit/
 
 ---
 
+## 무인 운용
+
+키를 넣고 `live` 를 띄우면 사람 개입 없이 돈다. 다만 **프로세스가 죽으면
+손절 주문이 나가지 않는다.** 자동매매의 실제 손실은 전략 오류보다
+프로세스 중단에서 더 자주 나온다. 반드시 감시 하에 띄운다.
+
+```bash
+# Linux (systemd)
+sudo cp deploy/ubbit.service /etc/systemd/system/
+sudo cp deploy/ubbit.env.example /etc/ubbit.env   # 키 입력 후 chmod 600
+sudo systemctl enable --now ubbit
+journalctl -u ubbit -f
+
+# macOS / WSL
+./deploy/run.sh config.proven.yaml
+```
+
+둘 다 죽으면 15초 후 재시작하고, **10분 안에 5회 넘게 죽으면 멈춘다.**
+무한 재시작은 같은 실패 주문을 반복해 상황을 악화시킨다.
+
+### 재기동 잔고 대조
+
+기동할 때마다 로컬 DB 와 거래소 실제 잔고를 대조한다 (`reconcile_on_start`).
+
+- **DB 에 있는데 계좌에 없음** → 관리 중단. 그대로 두면 손절이 매 주기
+  실패하는데 봇은 지키는 중이라 착각한다. 손익은 추정하지 않고 0 으로
+  기록하므로 실제 손익은 업비트 거래내역에서 확인해야 한다.
+- **부분만 남음** → 실제 수량으로 축소하고 계속 관리한다.
+- **계좌에 있는데 DB 에 없음** → 경고만 한다. **절대 자동으로 팔지 않는다.**
+  사용자의 장기 보유분일 수 있기 때문이다. 직접 처리하거나 계좌를 분리한다.
+
+`engine.halt_on_mismatch: true` 로 두면 불일치 시 아예 기동하지 않는다.
+사실과 다른 상태를 믿고 도는 것보다 안 도는 편이 안전하다는 판단이면 켠다.
+
+### 알림
+
+봇이 조용히 망가지는 것을 막으려면 웹훅을 건다. Slack Incoming Webhook 과
+Discord Webhook 을 모두 지원한다.
+
+```bash
+export UBBIT_WEBHOOK_URL=https://hooks.slack.com/services/...
+```
+
+전송 대상은 진입, 청산, 매매 중단(손실한도·쿨다운), 주문 실패,
+재기동 잔고 불일치, 엔진 시작·정지다. 체결 하나하나를 다 보내지는 않는다.
+알림이 잦으면 정작 중요한 것을 놓친다. 알림 전송이 실패해도 매매는 계속된다.
+
+---
+
 ## 실거래 체크리스트
 
 - [ ] `doctor` 통과 (서버 실측 수수료가 config와 일치하는지 포함)
@@ -293,9 +345,12 @@ ubbit/
 - [ ] 허용 IP 등록 확인
 - [ ] `max_order_krw`를 잃어도 되는 금액으로 설정
 - [ ] `.KILL` 파일 생성으로 즉시 정지되는지 실제로 테스트
+- [ ] systemd 또는 `deploy/run.sh` 로 자동 재시작 구성
+- [ ] `UBBIT_WEBHOOK_URL` 설정 후 알림이 실제로 오는지 확인
+- [ ] 봇 전용 계좌 분리 (장기 보유분과 섞이면 대조가 무의미해진다)
 
 ```bash
-python -m unittest discover -s tests -t .     # 112 tests
+python -m unittest discover -s tests -t .     # 127 tests
 ```
 
 ---

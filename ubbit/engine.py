@@ -20,6 +20,8 @@ from .broker import Broker, Fill, LiveBroker, PaperBroker
 from .config import Config
 from .fees import CostModel
 from .logutil import get_logger
+from .notify import Notifier
+from .reconcile import reconcile
 from .risk import RiskManager
 from .session import KST
 from .session import evaluate as evaluate_session
@@ -57,6 +59,9 @@ class TradingEngine:
         self.clock: Callable[[], datetime] = datetime.now
         self.markets: list[str] = list(cfg.engine.markets)
         self._universe_refreshed_at: float = 0.0
+        self.notifier = Notifier(cfg.notify, label=f"ubbit/{cfg.mode}")
+        self._reconciled = False
+        self._halted_reason = ""
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
 
@@ -98,6 +103,44 @@ class TradingEngine:
         if dropped:
             log.info("   보유 중이라 유지: %s", ", ".join(dropped))
 
+    def startup_checks(self) -> bool:
+        """기동 전 점검. 거래소 실제 잔고와 로컬 DB 를 대조한다.
+
+        False 를 반환하면 기동하지 않는다. 사실과 다른 상태를 믿고 도는 것보다
+        아예 안 도는 편이 안전하기 때문이다.
+        """
+        if self._reconciled or not self.cfg.engine.reconcile_on_start:
+            return True
+        self._reconciled = True
+        if not isinstance(self.broker, LiveBroker):
+            return True          # Paper 는 브로커가 곧 장부라 대조 대상이 없다
+
+        positions = self.store.all_positions()
+        prices: dict[str, float] = {}
+        if positions:
+            try:
+                prices = {t["market"]: float(t["trade_price"])
+                          for t in self.client.ticker([p.market for p in positions])}
+            except UpbitError as exc:
+                log.warning("대조용 현재가 조회 실패: %s", exc)
+
+        report = reconcile(self.store, self.broker, prices, self.clock)
+        for line in report.lines():
+            (log.info if report.clean else log.warning)("%s", line)
+
+        if report.clean:
+            return True
+
+        summary = " / ".join(
+            f"{m.kind}:{m.market}" for m in report.dropped + report.adjusted + report.orphans)
+        self.notifier.send("error", f"재기동 잔고 불일치 — {summary}")
+
+        if self.cfg.engine.halt_on_mismatch:
+            log.error("halt_on_mismatch=true → 기동을 중단합니다. "
+                      "업비트 거래내역과 대조 후 data/*.db 를 정리하고 다시 실행하세요.")
+            return False
+        return True
+
     def _session_now(self) -> datetime | None:
         """세션 판정용 시각. 기본 시계를 쓰되 tz 정보가 없으면 KST 로 간주한다."""
         now = self.clock()
@@ -131,6 +174,14 @@ class TradingEngine:
                  self.cfg.risk.daily_trade_limit, self.cfg.risk.max_concurrent)
         log.info("=" * 78)
 
+        if not self.startup_checks():
+            self.store.close()
+            return
+
+        self.notifier.send("info", f"엔진 시작 — {self.broker.mode} / "
+                           f"{self.cfg.engine.candle_unit}분봉 / "
+                           f"{'자동선별' if self.cfg.engine.universe_auto else ','.join(self.markets)}")
+
         while not self._stop:
             started = time.monotonic()
             try:
@@ -142,7 +193,9 @@ class TradingEngine:
             elapsed = time.monotonic() - started
             time.sleep(max(self.cfg.engine.poll_seconds - elapsed, 1.0))
 
-        log.info("정지 완료. 보유 포지션 %d건은 유지됩니다.", len(self.store.all_positions()))
+        held = len(self.store.all_positions())
+        log.info("정지 완료. 보유 포지션 %d건은 유지됩니다.", held)
+        self.notifier.send("halt", f"엔진 정지 — 보유 포지션 {held}건은 손절 없이 남습니다")
         self.store.close()
 
     # -------------------------------------------------------------------- tick
@@ -214,6 +267,9 @@ class TradingEngine:
             ok, why = self.risk.can_open(market, total, open_positions, exposure, now)
             if not ok:
                 log.info("[%s] 진입 차단 - %s", market, why)
+                if ("손실한도" in why or "쿨다운" in why) and self._halted_reason != why:
+                    self._halted_reason = why
+                    self.notifier.send("halt", f"매매 중단 — {why}")
                 continue
 
             if self._open_position(market, sig, cash, total, exposure):
@@ -262,6 +318,7 @@ class TradingEngine:
                                 {"krw": size_krw, "ref_price": entry_price}, fill.raw or fill.error)
         if not fill.ok:
             log.error("[%s] 매수 실패: %s", market, fill.error)
+            self.notifier.send("error", f"{market} 매수 실패 — {fill.error}")
             return False
 
         position = Position(
@@ -278,6 +335,8 @@ class TradingEngine:
         )
         self.store.upsert_position(position)
         self.risk.record_entry()
+        self.notifier.send("entry", f"{market} 매수 {w(fill.krw)}원 @ {w(fill.price, 2)} "
+                           f"손절 {w(position.stop_price, 2)} 목표순익 {pct(position.target_net)}")
         log.info("[%s] 매수 체결 단가=%s 수량=%.8f 투입=%s 수수료=%s 손절=%s 목표순익=%s",
                  market, w(fill.price, 2), fill.qty, w(fill.krw), w(fill.fee),
                  w(position.stop_price, 2), pct(position.target_net))
@@ -326,6 +385,8 @@ class TradingEngine:
                                 {"qty": position.qty, "ref_price": price}, fill.raw or fill.error)
         if not fill.ok:
             log.error("[%s] 매도 실패: %s (포지션 유지, 다음 주기 재시도)", market, fill.error)
+            self.notifier.send("error", f"{market} 매도 실패 — {fill.error} "
+                               f"(포지션 유지, 재시도). 반복되면 직접 확인 필요")
             self.store.upsert_position(position)
             return
 
@@ -342,6 +403,7 @@ class TradingEngine:
         )
         self.store.delete_position(market)
         self.risk.record_exit(market, net_pnl, self.clock())
+        self.notifier.send("exit", f"{market} 매도 {pct(net_ret)} ({w(net_pnl)}원) — {exit_kind}")
         log.info("[%s] 매도 체결 단가=%s 회수=%s 순손익=%s (%s) 수수료합=%s",
                  market, w(fill.price, 2), w(fill.krw), w(net_pnl), pct(net_ret),
                  w(entry_fee + fill.fee))

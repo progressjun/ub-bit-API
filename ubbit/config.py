@@ -9,6 +9,7 @@ import yaml
 
 from .adapt import PromotionRules, WalkForwardConfig
 from .fees import CostModel
+from .notify import NotifyParams
 from .risk import RiskParams
 from .session import SessionParams
 from .strategy import StrategyParams
@@ -31,6 +32,8 @@ class EngineParams:
     universe_refresh_minutes: int = 60
     adaptive_params: bool = False     # data/params.json 의 승격 파라미터 사용
     param_file: str = "data/params.json"
+    reconcile_on_start: bool = True   # 재기동 시 거래소 잔고와 대조
+    halt_on_mismatch: bool = False    # 불일치 시 기동 중단 (기본은 조정 후 계속)
 
 
 @dataclass
@@ -44,6 +47,7 @@ class Config:
     universe: UniverseParams = field(default_factory=UniverseParams)
     walk_forward: WalkForwardConfig = field(default_factory=WalkForwardConfig)
     promotion: PromotionRules = field(default_factory=PromotionRules)
+    notify: NotifyParams = field(default_factory=NotifyParams)
     access_key: str = ""
     secret_key: str = ""
 
@@ -63,8 +67,15 @@ def _build(cls: type, data: dict[str, Any] | None):
 
 
 def load_config(path: str | None = None) -> Config:
+    """설정 로딩.
+
+    경로를 명시했는데 파일이 없으면 예외를 낸다. 조용히 기본값으로 떨어지면
+    오타 하나로 의도와 다른 설정(다른 타임프레임, 다른 한도)으로 매매하게 된다.
+    """
     raw: dict[str, Any] = {}
-    if path and os.path.exists(path):
+    if path:
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
         with open(path, "r", encoding="utf-8") as fh:
             raw = yaml.safe_load(fh) or {}
 
@@ -78,9 +89,12 @@ def load_config(path: str | None = None) -> Config:
         universe=_build(UniverseParams, raw.get("universe")),
         walk_forward=_build(WalkForwardConfig, raw.get("walk_forward")),
         promotion=_build(PromotionRules, raw.get("promotion")),
+        notify=_build(NotifyParams, raw.get("notify")),
         access_key=os.getenv("UPBIT_ACCESS_KEY", ""),
         secret_key=os.getenv("UPBIT_SECRET_KEY", ""),
     )
+    if os.getenv("UBBIT_WEBHOOK_URL"):
+        cfg.notify.webhook_url = os.environ["UBBIT_WEBHOOK_URL"]
     validate(cfg)
     return cfg
 

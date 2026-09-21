@@ -625,9 +625,26 @@ def cmd_live(cfg: Config, args: argparse.Namespace) -> int:
 
 
 # ----------------------------------------------------------------------- main
+def _key_hint(message: str) -> None:
+    if "UPBIT_ACCESS_KEY" not in message:
+        return
+    print("\n  export UPBIT_ACCESS_KEY=...", file=sys.stderr)
+    print("  export UPBIT_SECRET_KEY=...", file=sys.stderr)
+    print("  키 발급: https://upbit.com/mypage/open_api_management", file=sys.stderr)
+    print("  '자산조회' + '주문하기'만 체크하고 출금 권한은 주지 마세요.", file=sys.stderr)
+
+
+def _default_config() -> str:
+    for name in ("config.yaml", "config.proven.yaml"):
+        if os.path.exists(name):
+            return name
+    return "config.yaml"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ubbit", description="업비트 수수료 인지형 자동매매")
-    parser.add_argument("-c", "--config", default="config.yaml", help="설정 파일 경로")
+    parser.add_argument("-c", "--config", default=None,
+                        help="설정 파일 경로 (기본: config.yaml → config.proven.yaml 순)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("costs", help="비용 구조 분석").set_defaults(func=cmd_costs)
@@ -707,9 +724,31 @@ def main(argv: list[str] | None = None) -> int:
     p_live.set_defaults(func=cmd_live)
 
     args = parser.parse_args(argv)
-    cfg = load_config(args.config)
+    args.config = args.config or _default_config()
+    try:
+        cfg = load_config(args.config)
+    except ValueError as exc:
+        # 설정 오류는 사용자가 고칠 문제다. 스택 트레이스는 도움이 되지 않는다.
+        print(f"설정 오류: {exc}", file=sys.stderr)
+        _key_hint(str(exc))
+        return 2
+    except FileNotFoundError as exc:
+        print(f"설정 파일 없음: {exc}", file=sys.stderr)
+        print("  사용 가능한 설정: " + ", ".join(
+            f for f in ("config.yaml", "config.proven.yaml", "config.scalp.yaml",
+                        "config.example.yaml") if os.path.exists(f)), file=sys.stderr)
+        return 2
+
     setup_logging(cfg.engine.log_level)
-    return args.func(cfg, args)
+    try:
+        return args.func(cfg, args)
+    except ValueError as exc:
+        print(f"설정 오류: {exc}", file=sys.stderr)
+        _key_hint(str(exc))
+        return 2
+    except KeyboardInterrupt:
+        print("\n중단됨")
+        return 130
 
 
 if __name__ == "__main__":
