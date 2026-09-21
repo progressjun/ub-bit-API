@@ -22,6 +22,7 @@ from .fees import CostModel, estimate_slippage_from_orderbook, infer_tick_size
 from .logutil import setup_logging
 from .strategy import Candle
 from .universe import build_universe
+from .validate import ValidationRules, collect_oos_trades, evaluate
 from .upbit import UpbitClient, UpbitError
 
 CANDLE_DIR = "data/candles"
@@ -309,6 +310,214 @@ def cmd_optimize(cfg: Config, args: argparse.Namespace) -> int:
     return exit_code
 
 
+# ------------------------------------------------------------------ validate
+def cmd_validate(cfg: Config, args: argparse.Namespace) -> int:
+    """엣지의 통계적 입증. 백테스트 수익률이 아니라 검정 결과로 판정한다.
+
+    종목을 풀링해 표본을 수백 건으로 올린 뒤, 진입 방식(가설)별로
+    부트스트랩 신뢰구간과 순열검정을 돌린다. 본페로니 보정 분모는
+    실제로 검정한 (진입방식 × 타임프레임) 조합 수다.
+    """
+    from dataclasses import replace as _replace
+
+    units = args.units or [cfg.engine.candle_unit]
+    modes = args.modes or ["breakout", "squeeze", "pullback"]
+    hypotheses = len(units) * len(modes)
+
+    rules = ValidationRules(
+        min_trades=args.min_trades, min_markets=args.min_markets,
+        hypotheses=hypotheses, breadth=args.breadth,
+        bootstrap_iters=args.bootstrap, permutation_iters=args.permutation,
+    )
+
+    print("=" * 80)
+    print("엣지 통계 검증")
+    print("=" * 80)
+    print(f"  검정 가설 수     {hypotheses}개 (진입방식 {len(modes)} × 타임프레임 {len(units)})")
+    print(f"  유의수준         {rules.alpha} → 본페로니 보정 후 {rules.alpha/hypotheses:.4f}")
+    print(f"  표본 하한        OOS 거래 {rules.min_trades}건 / 종목 {rules.min_markets}개")
+    print(f"  견고성 하한      수익 종목 비율 {rules.breadth*100:.0f}%, 부트스트랩 CI 하한 > 0")
+    print(f"  비용 전제        {cfg.cost.describe()}")
+
+    evidences = []
+    for unit in units:
+        market_candles = _load_market_candles(unit, args.min_bars)
+        if not market_candles:
+            print(f"\n[{unit}분봉] 캔들 파일 없음. `python scripts/fetch_all.py` 를 먼저 실행하세요.")
+            continue
+        print(f"\n[{unit}분봉] 종목 {len(market_candles)}개 로드 "
+              f"(각 {min(len(c) for c in market_candles.values())}~"
+              f"{max(len(c) for c in market_candles.values())}봉)")
+        for mode in modes:
+            params = _replace(cfg.strategy, entry_mode=mode)
+            results = collect_oos_trades(
+                market_candles, cost=cfg.cost, params=params, rparams=cfg.risk,
+                train_bars=args.train_bars, test_bars=args.test_bars,
+                initial_krw=cfg.engine.initial_krw,
+            )
+            evidence = evaluate(f"{mode} @ {unit}분봉", results, market_candles,
+                                cost=cfg.cost, rules=rules)
+            evidences.append(evidence)
+            print()
+            print(evidence.render())
+
+    print("\n" + "=" * 80)
+    proven = [e for e in evidences if e.proven]
+    if proven:
+        print("입증된 가설:")
+        for e in proven:
+            print(f"  ✅ {e.label} — 거래당 평균 순수익 {e.mean_net*100:+.4f}%, "
+                  f"p={e.p_value:.4f}, CI 하한 {e.ci_low*100:+.4f}%")
+        print("\n다음 단계: 해당 조합으로 paper 를 최소 8주 운용해 실체결 성과를 대조할 것.")
+        print("           백테스트는 호가 소진과 거래소 지연을 재현하지 못한다.")
+    else:
+        print("입증된 가설 없음.")
+        print("이 표본에서 어떤 진입 방식도 '무작위 진입 + 수수료' 대비 통계적 우위를")
+        print("보이지 못했다. 실거래 투입 근거가 없다는 뜻이다.")
+        best = max(evidences, key=lambda e: e.mean_net) if evidences else None
+        if best:
+            print(f"\n가장 근접한 가설: {best.label} (거래당 {best.mean_net*100:+.4f}%)")
+            for f in best.failures:
+                print(f"  · {f}")
+    print("=" * 80)
+    return 0 if proven else 3
+
+
+def _load_market_candles(unit: int, min_bars: int) -> dict[str, list[Candle]]:
+    out: dict[str, list[Candle]] = {}
+    if not os.path.isdir(CANDLE_DIR):
+        return out
+    for name in sorted(os.listdir(CANDLE_DIR)):
+        if not name.endswith(f"_{unit}m.json"):
+            continue
+        market = name[: -len(f"_{unit}m.json")]
+        with open(os.path.join(CANDLE_DIR, name), "r", encoding="utf-8") as fh:
+            rows = json.load(fh)
+        if len(rows) < min_bars:
+            continue
+        out[market] = [Candle.from_upbit(r) for r in rows]
+    return out
+
+
+# -------------------------------------------------------------------- status
+def cmd_status(cfg: Config, args: argparse.Namespace) -> int:
+    """운용 현황. paper/live 실행 중에 다른 터미널에서 확인한다."""
+    from .state import Store
+
+    db_path = args.db or cfg.engine.db_path
+    if not os.path.exists(db_path):
+        print(f"DB 없음: {db_path}  (아직 한 번도 실행하지 않았습니다)")
+        return 1
+    store = Store(db_path)
+
+    positions = store.all_positions()
+    prices: dict[str, float] = {}
+    if positions:
+        try:
+            for t in UpbitClient().ticker([p.market for p in positions]):
+                prices[t["market"]] = float(t["trade_price"])
+        except UpbitError as exc:
+            print(f"[경고] 현재가 조회 실패: {exc}")
+
+    print("=" * 92)
+    print(f"보유 포지션 {len(positions)}건")
+    print("=" * 92)
+    if positions:
+        print(f"{'종목':<12}{'진입가':>14}{'현재가':>14}{'순손익':>10}{'손절가':>14}"
+              f"{'목표순익':>10}{'보유':>6}")
+        for pos in positions:
+            price = prices.get(pos.market, pos.entry_price)
+            net = cfg.cost.net_return(pos.entry_price, price)
+            print(f"{pos.market:<12}{pos.entry_price:>14,.2f}{price:>14,.2f}"
+                  f"{net*100:>+9.3f}%{pos.stop_price:>14,.2f}"
+                  f"{pos.target_net*100:>9.2f}%{pos.bars_held:>5}봉")
+    else:
+        print("  (없음)")
+
+    perf = store.performance()
+    print("\n" + "=" * 92)
+    print("누적 성과")
+    print("=" * 92)
+    print(f"  거래 {perf['trades']}건  순손익 {perf['net_pnl']:,.0f}원  "
+          f"승률 {perf['win_rate']*100:.1f}%  "
+          f"손익비 " + (f"{perf['profit_factor']:.2f}" if perf["profit_factor"] else "n/a"))
+    print(f"  지불 수수료 {perf['fees_paid']:,.0f}원", end="")
+    if perf["fee_to_pnl"]:
+        print(f"  (순손익 절대값의 {perf['fee_to_pnl']*100:.0f}%)")
+    else:
+        print()
+    if perf["trades"]:
+        print(f"  통계적 판단 가능 시점: 거래 50건 이상 "
+              f"(현재 {perf['trades']}건, {'충족' if perf['trades'] >= 50 else '미달'})")
+
+    trades = store.recent_trades(args.limit)
+    if trades:
+        print("\n최근 체결 " + str(len(trades)) + "건")
+        print(f"{'종목':<12}{'청산시각':<20}{'순수익':>10}{'손익':>12}{'사유':<14}")
+        for t in trades:
+            print(f"{t['market']:<12}{t['closed_at']:<20}{t['net_return']*100:>+9.3f}%"
+                  f"{t['net_pnl']:>+12,.0f}  {t['exit_kind']:<14}")
+    store.close()
+    return 0
+
+
+# -------------------------------------------------------------------- replay
+def cmd_replay(cfg: Config, args: argparse.Namespace) -> int:
+    """과거 캔들로 실제 엔진을 고속 재생한다 (주문 없음, Paper 브로커).
+
+    backtest 는 전략 함수만 검증한다. replay 는 리스크 게이트·세션 제어·
+    영속화까지 실거래와 같은 경로를 태운다. 배포 전 최종 점검용이다.
+    """
+    import shutil
+
+    from .engine import TradingEngine
+    from .replay import run_replay
+
+    unit = args.unit or cfg.engine.candle_unit
+    data = _load_market_candles(unit, args.min_bars)
+    if args.markets:
+        data = {m: c for m, c in data.items() if m in set(args.markets)}
+    if not data:
+        print(f"{unit}분봉 캔들 없음. `python scripts/fetch_all.py` 또는 "
+              f"`python -m ubbit fetch <종목> --unit {unit}` 를 먼저 실행하세요.")
+        return 1
+
+    cfg.mode = "paper"
+    cfg.engine.universe_auto = False
+    cfg.engine.db_path = args.db
+    if os.path.exists(args.db) and not args.keep:
+        os.remove(args.db)
+    os.makedirs(os.path.dirname(args.db) or ".", exist_ok=True)
+
+    length = max(len(c) for c in data.values())
+    start = max(cfg.strategy.warmup_bars + 5, args.start or int(length * 0.6))
+
+    print("=" * 84)
+    print(f"엔진 재생 — {unit}분봉, 종목 {len(data)}개, 봉 {start}~{length} "
+          f"({(length-start)*unit/1440:.0f}일 구간)")
+    print(f"진입방식 {cfg.strategy.entry_mode} | 초기자본 {cfg.engine.initial_krw:,.0f}원 | "
+          f"{cfg.cost.describe()}")
+    print("=" * 84)
+
+    engine = TradingEngine(cfg)
+    try:
+        run_replay(engine, data, start_at=start, step=args.step)
+    finally:
+        perf = engine.store.performance()
+        total, cash, exposure = engine.broker.equity(
+            {m: c[-1].close for m, c in data.items()})
+        print("=" * 84)
+        print(f"재생 종료 — 자산 {total:,.0f}원 "
+              f"({total/cfg.engine.initial_krw - 1:+.2%})")
+        print(f"  거래 {perf['trades']}건  순손익 {perf['net_pnl']:,.0f}원  "
+              f"승률 {perf['win_rate']*100:.1f}%  "
+              f"수수료 {perf['fees_paid']:,.0f}원")
+        print(f"  상세: python -m ubbit -c {args.config} status --db {args.db}")
+        print("=" * 84)
+        engine.store.close()
+    return 0
+
+
 # -------------------------------------------------------------------- doctor
 def cmd_doctor(cfg: Config, args: argparse.Namespace) -> int:
     print("=" * 74)
@@ -442,6 +651,35 @@ def main(argv: list[str] | None = None) -> int:
     p_opt.add_argument("--count", type=int, default=None)
     p_opt.add_argument("--apply", action="store_true", help="승격 조건 충족 시 실제로 반영")
     p_opt.set_defaults(func=cmd_optimize)
+
+    p_val = sub.add_parser("validate", help="엣지 통계 검증 (부트스트랩 + 순열검정)")
+    p_val.add_argument("--units", nargs="*", type=int, default=None)
+    p_val.add_argument("--modes", nargs="*", default=None,
+                       choices=["breakout", "squeeze", "pullback"])
+    p_val.add_argument("--train-bars", type=int, default=1200, help="설계에 쓴 것으로 간주할 앞 구간")
+    p_val.add_argument("--test-bars", type=int, default=500)
+    p_val.add_argument("--min-bars", type=int, default=2000)
+    p_val.add_argument("--min-trades", type=int, default=200)
+    p_val.add_argument("--min-markets", type=int, default=8)
+    p_val.add_argument("--breadth", type=float, default=0.55)
+    p_val.add_argument("--bootstrap", type=int, default=5000)
+    p_val.add_argument("--permutation", type=int, default=2000)
+    p_val.set_defaults(func=cmd_validate)
+
+    p_st = sub.add_parser("status", help="보유 포지션·누적 성과 확인")
+    p_st.add_argument("--limit", type=int, default=20)
+    p_st.add_argument("--db", default=None, help="DB 경로 직접 지정 (예: data/replay.db)")
+    p_st.set_defaults(func=cmd_status)
+
+    p_rp = sub.add_parser("replay", help="과거 캔들로 엔진 고속 재생")
+    p_rp.add_argument("--markets", nargs="*", default=None)
+    p_rp.add_argument("--unit", type=int, default=None)
+    p_rp.add_argument("--start", type=int, default=None, help="시작 봉 인덱스")
+    p_rp.add_argument("--step", type=int, default=1)
+    p_rp.add_argument("--min-bars", type=int, default=500)
+    p_rp.add_argument("--db", default="data/replay.db")
+    p_rp.add_argument("--keep", action="store_true", help="기존 DB 유지(이어서 재생)")
+    p_rp.set_defaults(func=cmd_replay)
 
     sub.add_parser("doctor", help="키/권한/슬리피지 점검").set_defaults(func=cmd_doctor)
     sub.add_parser("paper", help="가상매매 실행").set_defaults(func=cmd_paper)

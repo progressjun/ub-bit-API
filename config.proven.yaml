@@ -1,0 +1,88 @@
+# 통계 검증을 통과한 설정. 2026-09-21 기준.
+#
+# 검증 결과 (python -m ubbit validate --units 15 60 240 --modes breakout squeeze pullback)
+#   가설 9개 중 breakout @ 240분봉만 6개 관문을 전부 통과.
+#   OOS 거래 218건 / 종목 19개 / 거래당 평균 순수익 +0.8486%
+#   순열검정 p=0.0035 (본페로니 보정 기준 0.0056)
+#   부트스트랩 95% CI [+0.0056%, +1.7688%]
+#   같은 기간 단순보유 -47.95% → 시장 베타가 아님
+#
+# 경고: CI 하한이 +0.0056%로 0에 매우 가깝다. 기대값이 소수의 큰 수익에
+#       의존한다는 뜻이며(중앙값은 -1.86%), 실거래 성과는 이보다 낮을 수 있다.
+
+mode: paper
+
+engine:
+  universe_auto: true          # KRW 마켓 전체(알트 포함) 자동 스캔
+  universe_refresh_minutes: 240
+  markets: []
+  candle_unit: 240             # 검증을 통과한 타임프레임
+  candle_count: 200
+  poll_seconds: 60
+  initial_krw: 1000000
+  db_path: data/proven.db
+  param_file: data/params.json
+  adaptive_params: false
+  log_level: INFO
+  kill_switch_file: .KILL
+  dynamic_slippage: true
+  liquidity_min_value_krw: 100000000
+
+session:
+  enabled: false               # 240분봉은 24시간 운용. 봉 하나가 4시간이다.
+  start: "09:00"
+  end: "18:00"
+  days: [0, 1, 2, 3, 4]
+  no_entry_before_close_minutes: 10
+  flatten_at_close: true
+
+universe:
+  top_n: 4
+  min_turnover_krw: 30000000000
+  atr_cost_multiple: 4.0
+  atr_max_pct: 0.08            # 240분봉은 ATR%가 본래 크다
+  sample_bars: 120
+  probe_order_krw: 500000
+  max_round_trip_cost: 0.004
+  exclude_warning: true
+
+cost:
+  fee_buy: 0.0005
+  fee_sell: 0.0005
+  slippage_buy: 0.0005
+  slippage_sell: 0.0005
+  min_order_krw: 5000
+
+strategy:
+  entry_mode: breakout
+  ema_fast: 20
+  ema_slow: 60
+  trend_slope_lookback: 10
+  breakout_period: 20
+  rsi_period: 14
+  rsi_min: 50
+  rsi_max: 78
+  atr_period: 14
+  atr_cost_multiple: 4.0
+  atr_max_pct: 0.08
+  volume_period: 20
+  volume_expansion: 1.2
+  stop_atr: 1.5
+  trail_atr: 2.0
+  take_profit_atr: 3.0
+  min_net_target: 0.004
+  max_hold_bars: 96            # 240분봉 96봉 = 16일
+  warmup_bars: 80
+
+risk:
+  risk_per_trade: 0.005
+  max_position_pct: 0.20
+  max_total_exposure: 0.60
+  max_concurrent: 3
+  daily_loss_limit: 0.03
+  daily_trade_limit: 4         # 240분봉에서 하루 4회 이상은 구조적으로 나오지 않는다
+  consecutive_loss_pause: 3
+  cooldown_minutes: 240
+  reentry_cooldown_minutes: 240
+  min_order_krw: 5000
+  max_order_krw: 1000000

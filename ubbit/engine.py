@@ -12,6 +12,7 @@ import os
 import signal
 import time
 from dataclasses import replace
+from typing import Callable
 from datetime import datetime
 
 from .adapt import ParamStore
@@ -20,6 +21,7 @@ from .config import Config
 from .fees import CostModel
 from .logutil import get_logger
 from .risk import RiskManager
+from .session import KST
 from .session import evaluate as evaluate_session
 from .state import Position, Store
 from .strategy import Candle, FeeAwareTrendStrategy, PositionView, Signal, pct
@@ -50,6 +52,9 @@ class TradingEngine:
         self._stop = False
         self._last_bar_ts: dict[str, str] = {}
         self.params_store = ParamStore(cfg.engine.param_file) if cfg.engine.adaptive_params else None
+        # 주입 가능한 시계. 실거래는 실제 시각, replay 는 캔들 타임스탬프를 쓴다.
+        # 이것이 없으면 재생 중 1200봉이 전부 '같은 날'로 집계돼 일일 한도에 걸린다.
+        self.clock: Callable[[], datetime] = datetime.now
         self.markets: list[str] = list(cfg.engine.markets)
         self._universe_refreshed_at: float = 0.0
         signal.signal(signal.SIGINT, self._handle_signal)
@@ -92,6 +97,13 @@ class TradingEngine:
         dropped = [m for m in held if m not in selected]
         if dropped:
             log.info("   보유 중이라 유지: %s", ", ".join(dropped))
+
+    def _session_now(self) -> datetime | None:
+        """세션 판정용 시각. 기본 시계를 쓰되 tz 정보가 없으면 KST 로 간주한다."""
+        now = self.clock()
+        if now is datetime.now:      # pragma: no cover - 방어
+            return None
+        return now if now.tzinfo else now.replace(tzinfo=KST)
 
     def _handle_signal(self, *_args) -> None:
         log.warning("종료 신호 수신. 현재 루프 종료 후 정지합니다. (포지션은 청산하지 않음)")
@@ -136,7 +148,7 @@ class TradingEngine:
     # -------------------------------------------------------------------- tick
     def tick(self) -> None:
         killed = os.path.exists(self.cfg.engine.kill_switch_file)
-        session = evaluate_session(self.cfg.session)
+        session = evaluate_session(self.cfg.session, self._session_now())
 
         self.refresh_universe()
 
@@ -153,8 +165,9 @@ class TradingEngine:
             candles_by_market[market] = candles
             prices[market] = candles[-1].close
 
+        now = self.clock()
         total, cash, exposure = self.broker.equity(prices)
-        self.risk.roll_day(total)
+        self.risk.roll_day(total, now)
         self.store.record_equity(total, cash, exposure)
 
         # 1) 장 마감 강제 청산 — 손익과 무관하게 실행한다.
@@ -198,7 +211,7 @@ class TradingEngine:
                 log.info("[%s] 진입 보류 - 거래대금 부족 %s원", market, w(candles[-1].value))
                 continue
 
-            ok, why = self.risk.can_open(market, total, open_positions, exposure)
+            ok, why = self.risk.can_open(market, total, open_positions, exposure, now)
             if not ok:
                 log.info("[%s] 진입 차단 - %s", market, why)
                 continue
@@ -260,6 +273,7 @@ class TradingEngine:
             target_net=sig.meta["target_net"],
             peak_price=fill.price,
             bars_held=0,
+            opened_at=self.clock().isoformat(timespec="seconds"),
             meta={"entry_reason": sig.reason, "entry_regime": sig.snapshot.regime},
         )
         self.store.upsert_position(position)
@@ -320,14 +334,14 @@ class TradingEngine:
         entry_fee = position.entry_krw * self.cost.fee_buy / (1 + self.cost.fee_buy)
         self.store.record_trade(
             market=market, opened_at=position.opened_at,
-            closed_at=datetime.now().isoformat(timespec="seconds"),
+            closed_at=self.clock().isoformat(timespec="seconds"),
             entry_price=position.entry_price, exit_price=fill.price, qty=fill.qty,
             entry_krw=position.entry_krw, exit_krw=fill.krw,
             fee_krw=entry_fee + fill.fee, net_pnl=net_pnl, net_return=net_ret,
             exit_kind=exit_kind, reason=reason,
         )
         self.store.delete_position(market)
-        self.risk.record_exit(market, net_pnl)
+        self.risk.record_exit(market, net_pnl, self.clock())
         log.info("[%s] 매도 체결 단가=%s 회수=%s 순손익=%s (%s) 수수료합=%s",
                  market, w(fill.price, 2), w(fill.krw), w(net_pnl), pct(net_ret),
                  w(entry_fee + fill.fee))

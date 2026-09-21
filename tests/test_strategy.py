@@ -244,3 +244,53 @@ class TestRiskGates(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEntryModes(unittest.TestCase):
+    """세 가지 진입 방식이 서로 다른 자리를 고르는지 확인.
+
+    같은 자리를 고른다면 가설을 3개로 나눈 의미가 없고, 본페로니 분모만
+    커져 검정력이 떨어진다.
+    """
+
+    def setUp(self):
+        self.cost = CostModel()
+
+    def _strategy(self, mode, **kw):
+        return FeeAwareTrendStrategy(StrategyParams(entry_mode=mode, **kw), self.cost)
+
+    def test_breakout_fires_on_breakout_fixture(self):
+        candles = breakout_candles()
+        strat = self._strategy("breakout")
+        self.assertEqual(strat.entry_signal(candles, strat.compute(candles)).action, "buy")
+
+    def test_pullback_does_not_fire_on_breakout_fixture(self):
+        """돌파 직후는 눌림이 아니다. 두 방식이 같은 자리를 고르면 안 된다."""
+        candles = breakout_candles()
+        strat = self._strategy("pullback")
+        sig = strat.entry_signal(candles, strat.compute(candles))
+        self.assertEqual(sig.action, "hold")
+        self.assertIn("눌림", sig.reason)
+
+    def test_squeeze_requires_prior_compression(self):
+        """압축 없이 변동성이 이미 큰 구간에서는 squeeze 가 진입하지 않는다."""
+        candles = breakout_candles(chop=0.02)      # 계속 출렁이는 = 압축 아님
+        strat = self._strategy("squeeze")
+        sig = strat.entry_signal(candles, strat.compute(candles))
+        self.assertEqual(sig.action, "hold")
+
+    def test_unknown_mode_never_buys(self):
+        candles = breakout_candles()
+        strat = self._strategy("nonsense")
+        sig = strat.entry_signal(candles, strat.compute(candles))
+        self.assertEqual(sig.action, "hold")
+        self.assertIn("알 수 없는", sig.reason)
+
+    def test_all_modes_share_the_cost_gate(self):
+        """진입 방식과 무관하게 dead 레짐에서는 아무도 진입하지 않는다."""
+        flat = make_candles(uptrend(step=0.0002), span=0.00005)
+        for mode in ("breakout", "squeeze", "pullback"):
+            strat = self._strategy(mode)
+            snaps = strat.compute(flat)
+            self.assertEqual(snaps[-1].regime, "dead")
+            self.assertEqual(strat.entry_signal(flat, snaps).action, "hold", mode)

@@ -63,6 +63,7 @@ class Candle:
 
 @dataclass
 class StrategyParams:
+    entry_mode: str = "breakout"   # breakout | squeeze | pullback
     ema_fast: int = 20
     ema_slow: int = 60
     trend_slope_lookback: int = 10
@@ -81,6 +82,10 @@ class StrategyParams:
     min_net_target: float = 0.004      # 목표 순익 하한 0.4% (= 비용의 2배)
     max_hold_bars: int = 96            # 5분봉 96봉 = 8시간
     warmup_bars: int = 80
+    squeeze_lookback: int = 50         # squeeze: ATR 압축 판정 구간
+    squeeze_ratio: float = 0.7         # 현재 ATR / 구간 중앙 ATR 이 이 값 이하 = 압축
+    pullback_rsi_max: float = 45.0     # pullback: 이 아래로 눌렸다 올라올 때 진입
+    pullback_recover_bars: int = 3
 
 
 @dataclass
@@ -97,6 +102,8 @@ class Snapshot:
     donchian_up: float | None = None
     donchian_dn: float | None = None
     vol_ratio: float | None = None
+    atr_median: float | None = None     # squeeze 판정용 구간 ATR 중앙값
+    rsi_min_recent: float | None = None  # pullback 판정용 최근 RSI 저점
     regime: str = "unknown"
 
     def ready(self) -> bool:
@@ -135,6 +142,19 @@ class FeeAwareTrendStrategy:
         for i, candle in enumerate(candles):
             atr_pct = (at[i] / candle.close) if (at[i] and candle.close) else None
             vol_ratio = (values[i] / vol_avg[i]) if vol_avg[i] else None
+
+            atr_median = None
+            if i >= self.p.squeeze_lookback:
+                window = [v for v in at[i - self.p.squeeze_lookback : i] if v]
+                if window:
+                    atr_median = sorted(window)[len(window) // 2]
+
+            rsi_min_recent = None
+            if i >= self.p.pullback_recover_bars:
+                window = [v for v in rs[i - self.p.pullback_recover_bars : i] if v is not None]
+                if window:
+                    rsi_min_recent = min(window)
+
             snap = Snapshot(
                 ts=candle.ts,
                 close=candle.close,
@@ -147,6 +167,8 @@ class FeeAwareTrendStrategy:
                 donchian_up=up[i],
                 donchian_dn=dn[i],
                 vol_ratio=vol_ratio,
+                atr_median=atr_median,
+                rsi_min_recent=rsi_min_recent,
             )
             snap.regime = self.classify_regime(snap)
             snaps.append(snap)
@@ -185,11 +207,9 @@ class FeeAwareTrendStrategy:
         if s.regime != "bull_trend":
             return Signal("hold", f"레짐 불일치 regime={s.regime}", s)
 
-        if s.close <= (s.donchian_up or float("inf")):
-            return Signal("hold", f"돌파 미성립 close={s.close:,.0f} <= {s.donchian_up:,.0f}", s)
-
-        if not (self.p.rsi_min <= (s.rsi or 0) <= self.p.rsi_max):
-            return Signal("hold", f"RSI 범위 밖 {s.rsi:.1f} ∉ [{self.p.rsi_min},{self.p.rsi_max}]", s)
+        ok, why = self._entry_trigger(s)
+        if not ok:
+            return Signal("hold", why, s)
 
         if (s.vol_ratio or 0) < self.p.volume_expansion:
             return Signal("hold", f"거래대금 미확장 ratio={s.vol_ratio or 0:.2f} < {self.p.volume_expansion}", s)
@@ -208,7 +228,7 @@ class FeeAwareTrendStrategy:
         return Signal(
             "buy",
             (
-                f"돌파진입 regime={s.regime} close={s.close:,.0f} > D{self.p.breakout_period}={s.donchian_up:,.0f} "
+                f"{self.p.entry_mode} 진입 regime={s.regime} close={s.close:,.0f} "
                 f"ATR%={pct(s.atr_pct)} RSI={s.rsi:.1f} vol×{s.vol_ratio:.2f} "
                 f"목표순익={pct(target_net)} 손절={pct(-risk)} RR={rr:.2f}"
             ),
@@ -221,6 +241,54 @@ class FeeAwareTrendStrategy:
                 "rr": rr,
             },
         )
+
+    def _entry_trigger(self, s: Snapshot) -> tuple[bool, str]:
+        """진입 방식별 트리거. 비용 게이트와 레짐 필터는 이미 통과한 상태로 들어온다.
+
+        세 방식 모두 같은 비용 게이트·리스크 게이트·청산 로직을 공유한다.
+        비교 대상이 '진입 시점을 고르는 방법' 하나로 한정되어야
+        어떤 가설이 통했는지 귀인이 가능하기 때문이다.
+        """
+        mode = self.p.entry_mode
+
+        if mode == "breakout":
+            # 직전 N봉 고가 돌파. 추세 지속에 베팅한다.
+            if s.close <= (s.donchian_up or float("inf")):
+                return False, f"돌파 미성립 close={s.close:,.0f} <= {s.donchian_up:,.0f}"
+            if not (self.p.rsi_min <= (s.rsi or 0) <= self.p.rsi_max):
+                return False, f"RSI 범위 밖 {s.rsi:.1f} ∉ [{self.p.rsi_min},{self.p.rsi_max}]"
+            return True, ""
+
+        if mode == "squeeze":
+            # 변동성 압축 후 확장. 가격이 아니라 변동성 상태 전환에 베팅한다.
+            if s.atr_median is None or not s.atr:
+                return False, "압축 판정 불가"
+            was_squeezed = s.atr_median > 0 and (s.atr / s.atr_median) > self.p.squeeze_ratio
+            if was_squeezed:
+                return False, (f"압축 미확인 ATR/중앙값={s.atr/s.atr_median:.2f} "
+                               f"> {self.p.squeeze_ratio}")
+            if s.close <= (s.donchian_up or float("inf")):
+                return False, f"확장 방향 미확정 close={s.close:,.0f} <= {s.donchian_up:,.0f}"
+            if (s.rsi or 0) > self.p.rsi_max:
+                return False, f"RSI 과열 {s.rsi:.1f} > {self.p.rsi_max}"
+            return True, ""
+
+        if mode == "pullback":
+            # 상승추세 중 눌림 회복. 돌파 대비 진입가가 낮아 손익비가 유리하다.
+            if s.rsi_min_recent is None or s.rsi is None:
+                return False, "눌림 판정 불가"
+            if s.rsi_min_recent > self.p.pullback_rsi_max:
+                return False, (f"눌림 없음 최근RSI저점={s.rsi_min_recent:.1f} "
+                               f"> {self.p.pullback_rsi_max}")
+            if s.rsi <= s.rsi_min_recent + 5.0:
+                return False, f"회복 미확인 RSI={s.rsi:.1f} vs 저점={s.rsi_min_recent:.1f}"
+            if s.rsi > self.p.rsi_max:
+                return False, f"RSI 과열 {s.rsi:.1f} > {self.p.rsi_max}"
+            if s.close <= (s.ema_fast or float("inf")):
+                return False, f"EMA{self.p.ema_fast} 회복 전 close={s.close:,.0f}"
+            return True, ""
+
+        return False, f"알 수 없는 entry_mode={mode}"
 
     def target_net(self, s: Snapshot) -> float:
         """목표 순수익률 = max(ATR 기반 목표, 비용 하한)."""
