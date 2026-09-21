@@ -618,6 +618,35 @@ def cmd_simulate(cfg: Config, args: argparse.Namespace) -> int:
     return 0 if all(verdicts) else 3
 
 
+# ----------------------------------------------------------------------- run
+def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
+    """엔진과 대시보드를 한 번에 띄운다. 터미널 하나, 브라우저 창 하나.
+
+    매매는 이 프로세스가 하고 브라우저는 보기와 제어만 한다. 프로세스가 죽으면
+    창도 같이 죽으므로 '창은 떠 있는데 매매는 멈춘' 상태가 생기지 않는다.
+    """
+    from .supervisor import run as run_supervisor
+
+    if args.live:
+        if not args.yes_i_know:
+            print("실거래는 --yes-i-know 플래그가 필요합니다.")
+            print("  확인: smoketest 통과 / paper 검증 / 출금권한 미부여 / 허용 IP 등록")
+            return 2
+        cfg.mode = "live"
+        from .config import validate
+        validate(cfg)
+        print("!" * 72)
+        print("실거래 모드. 실제 자금이 움직입니다.")
+        print(f"1회 최대 주문 {cfg.risk.max_order_krw:,.0f}원 / "
+              f"일 최대 {cfg.risk.daily_trade_limit}회 / "
+              f"일일 손실한도 {cfg.risk.daily_loss_limit*100:.1f}%")
+        print("!" * 72)
+    else:
+        cfg.mode = "paper"
+
+    return run_supervisor(cfg, args.host, args.port, open_browser=not args.no_browser)
+
+
 # ----------------------------------------------------------------- smoketest
 def cmd_smoketest(cfg: Config, args: argparse.Namespace) -> int:
     """최소 금액 실주문으로 LiveBroker 경로를 검증한다.
@@ -842,6 +871,14 @@ def main(argv: list[str] | None = None) -> int:
     p_sim.add_argument("--min-p-profit", type=float, default=0.60)
     p_sim.add_argument("--max-p-ruin", type=float, default=0.10)
     p_sim.set_defaults(func=cmd_simulate)
+
+    p_run = sub.add_parser("run", help="엔진 + 대시보드 동시 실행 (권장)")
+    p_run.add_argument("--live", action="store_true", help="실주문 (기본은 페이퍼)")
+    p_run.add_argument("--yes-i-know", action="store_true")
+    p_run.add_argument("--host", default="127.0.0.1")
+    p_run.add_argument("--port", type=int, default=8777)
+    p_run.add_argument("--no-browser", action="store_true")
+    p_run.set_defaults(func=cmd_run)
 
     p_smoke = sub.add_parser("smoketest", help="최소 금액 실주문으로 주문 경로 검증")
     p_smoke.add_argument("--market", default="KRW-BTC")

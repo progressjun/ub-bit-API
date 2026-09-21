@@ -99,6 +99,13 @@ risk:
   reentry_cooldown_minutes: 45
   min_order_krw: 5000
   max_order_krw: 500000
+  # 업비트 최소 주문금액은 매도에도 적용된다. 5,000원어치를 사면 가격이 1%만
+  # 빠져도 평가액이 4,950원이 되어 매도 주문이 거부되고, 손절이 영원히 실패한다.
+  # 진입 하한 = min_order_krw × dust_guard = 10,000원. 반토막이 나도 팔 수 있다.
+  dust_guard: 2.0
+  # 신호 강도(ATR 여유도·손익비·거래대금)가 세 축 모두 좋을 때만 사이즈를 키운다.
+  # 1.0 이면 강도와 무관하게 동일 사이즈. 키워도 max_position_pct 는 넘지 않는다.
+  conviction_max: 1.6
 
 walk_forward:
   train_bars: 1200

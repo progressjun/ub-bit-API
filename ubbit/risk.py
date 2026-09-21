@@ -25,6 +25,14 @@ class RiskParams:
     reentry_cooldown_minutes: int = 30  # 같은 종목 청산 후 재진입 금지 시간
     min_order_krw: float = 5_000.0
     max_order_krw: float = 1_000_000.0
+    # 최소 주문금액 대비 안전 배수. 왜 필요한가:
+    #   업비트 최소 주문금액은 매수뿐 아니라 매도에도 적용된다.
+    #   정확히 5,000원어치를 샀다가 가격이 1%만 빠지면 평가액이 4,950원이 되고,
+    #   그 순간 매도 주문이 거부된다. 손절이 영원히 실패하는 상태가 된다.
+    #   2.0 이면 50% 하락까지 매도 가능 금액이 유지된다.
+    dust_guard: float = 2.0
+    # 신호 강도에 따른 사이즈 배수 상한. 1.0 이면 강도와 무관하게 동일 사이즈.
+    conviction_max: float = 1.6
 
 
 @dataclass
@@ -86,6 +94,18 @@ class RiskManager:
         return True, "ok"
 
     # --------------------------------------------------------------- 사이징
+    @property
+    def entry_floor_krw(self) -> float:
+        """진입 최소 금액. 최소 주문금액 × 안전 배수.
+
+        이 아래로는 사지 않는다. 사더라도 못 파는 포지션이 되기 때문이다.
+        """
+        return self.p.min_order_krw * max(self.p.dust_guard, 1.0)
+
+    def sellable(self, value_krw: float) -> bool:
+        """지금 이 평가금액으로 시장가 매도가 가능한가."""
+        return value_krw >= self.p.min_order_krw
+
     def position_size_krw(
         self,
         equity: float,
@@ -93,6 +113,7 @@ class RiskManager:
         entry_price: float,
         stop_price: float,
         exposure_krw: float,
+        conviction: float = 0.0,
     ) -> tuple[float, str]:
         """손절폭 기반 사이징. 손절에 걸렸을 때의 손실이 risk_per_trade 가 되도록 역산한다.
 
@@ -108,7 +129,10 @@ class RiskManager:
         if loss_at_stop <= 0:
             return 0.0, "손실률 계산 실패"
 
-        size = equity * self.p.risk_per_trade / loss_at_stop
+        # 신호가 강할수록 사이즈를 키운다. 단 리스크 한도 자체는 건드리지 않는다.
+        # 키우는 것은 '이번 거래에 거는 자본 비율'이지 '손절 폭'이 아니다.
+        boost = 1.0 + max(min(conviction, 1.0), 0.0) * (max(self.p.conviction_max, 1.0) - 1.0)
+        size = equity * self.p.risk_per_trade * boost / loss_at_stop
         caps = {
             "risk": size,
             "position_pct": equity * self.p.max_position_pct,
@@ -119,9 +143,15 @@ class RiskManager:
         size = min(caps.values())
         binding = min(caps, key=lambda k: caps[k])
 
-        if size < self.p.min_order_krw:
-            return 0.0, f"최소주문 미달 {size:,.0f} < {self.p.min_order_krw:,.0f} (제약: {binding})"
-        return float(int(size)), f"사이즈 {size:,.0f}원 (손절폭 {stop_distance*100:.2f}%, 제약: {binding})"
+        floor = self.entry_floor_krw
+        if size < floor:
+            return 0.0, (f"진입 최소금액 미달 {size:,.0f} < {floor:,.0f}원 "
+                         f"(최소주문 {self.p.min_order_krw:,.0f} × 안전배수 "
+                         f"{self.p.dust_guard:.1f}, 제약: {binding})")
+        note = f"사이즈 {size:,.0f}원 (손절폭 {stop_distance*100:.2f}%, 제약: {binding}"
+        if boost > 1.001:
+            note += f", 신호강도 ×{boost:.2f}"
+        return float(int(size)), note + ")"
 
     # --------------------------------------------------------------- 결과 반영
     def record_exit(self, market: str, realized_pnl: float, now: datetime | None = None) -> None:

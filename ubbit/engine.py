@@ -38,6 +38,29 @@ def w(value: float, decimals: int = 0) -> str:
     return f"{value:,.{decimals}f}"
 
 
+def _conviction(sig: Signal, sparams, cost: CostModel) -> float:
+    """신호 강도 0~1. 사이즈를 키울지 판단하는 데만 쓴다.
+
+    세 축을 본다. 전부 '비용을 얼마나 여유 있게 넘기는가'의 변형이다.
+      여유도 : ATR% 가 진입 하한보다 얼마나 위인가
+      손익비 : 목표까지 거리 ÷ 손절까지 거리
+      참여도 : 거래대금이 평균 대비 얼마나 늘었나
+
+    평균을 내되 한 축이라도 기준 미달이면 강도를 올리지 않는다.
+    세 축이 동시에 좋을 때만 크게 거는 것이 이 함수의 목적이다.
+    """
+    snap = sig.snapshot
+    floor = cost.breakeven_edge * sparams.atr_cost_multiple
+    if not floor or snap.atr_pct is None:
+        return 0.0
+    headroom = min(max((snap.atr_pct / floor - 1.0) / 1.0, 0.0), 1.0)
+    rr = min(max((sig.meta.get("rr", 0.0) - 1.5) / 1.5, 0.0), 1.0)
+    vol = min(max(((snap.vol_ratio or 0.0) - sparams.volume_expansion) / 1.0, 0.0), 1.0)
+    if min(headroom, rr, vol) <= 0.0:
+        return 0.0
+    return (headroom + rr + vol) / 3.0
+
+
 class TradingEngine:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
@@ -60,6 +83,11 @@ class TradingEngine:
         self.markets: list[str] = list(cfg.engine.markets)
         self._universe_refreshed_at: float = 0.0
         self.notifier = Notifier(cfg.notify, label=f"ubbit/{cfg.mode}")
+        # 종목별 최근 판단. 대시보드가 '지금 봇이 무엇을 보고 있는가'를
+        # 그리기 위해 읽는다. 루프에서 쓰고 HTTP 스레드에서 읽으므로
+        # dict 통째 교체로만 갱신한다(파이썬 dict 할당은 원자적).
+        self.live: dict[str, dict] = {}
+        self.paused = False
         self._reconciled = False
         self._halted_reason = ""
         signal.signal(signal.SIGINT, self._handle_signal)
@@ -141,6 +169,28 @@ class TradingEngine:
             return False
         return True
 
+    def _record(self, market: str, snap, action: str, reason: str,
+                candles: list[Candle]) -> None:
+        """대시보드용 판단 스냅샷. 그래프와 사유를 함께 남긴다."""
+        tail = candles[-120:]
+        self.live[market] = {
+            "ts": (self.clock()).isoformat(timespec="seconds"),
+            "bar_ts": candles[-1].ts,
+            "price": candles[-1].close,
+            "action": action,
+            "reason": reason,
+            "regime": getattr(snap, "regime", "unknown"),
+            "atr_pct": getattr(snap, "atr_pct", None),
+            "rsi": getattr(snap, "rsi", None),
+            "vol_ratio": getattr(snap, "vol_ratio", None),
+            "donchian_up": getattr(snap, "donchian_up", None),
+            "ema_fast": getattr(snap, "ema_fast", None),
+            "ema_slow": getattr(snap, "ema_slow", None),
+            "atr_floor": self.cost.breakeven_edge * self.cfg.strategy.atr_cost_multiple,
+            "candles": [{"t": c.ts[5:16], "o": c.open, "h": c.high,
+                         "l": c.low, "c": c.close, "v": c.value} for c in tail],
+        }
+
     def _session_now(self) -> datetime | None:
         """세션 판정용 시각. 기본 시계를 쓰되 tz 정보가 없으면 KST 로 간주한다."""
         now = self.clock()
@@ -200,7 +250,7 @@ class TradingEngine:
 
     # -------------------------------------------------------------------- tick
     def tick(self) -> None:
-        killed = os.path.exists(self.cfg.engine.kill_switch_file)
+        killed = self.paused or os.path.exists(self.cfg.engine.kill_switch_file)
         session = evaluate_session(self.cfg.session, self._session_now())
 
         self.refresh_universe()
@@ -257,6 +307,7 @@ class TradingEngine:
             strategy = self.strategy_for(market)
             snaps = strategy.compute(candles)
             sig = strategy.entry_signal(candles, snaps)
+            self._record(market, sig.snapshot, sig.action, sig.reason, candles)
             if sig.action != "buy":
                 log.debug("[%s] %s", market, sig.reason)
                 continue
@@ -300,7 +351,9 @@ class TradingEngine:
     def _open_position(self, market: str, sig: Signal, cash: float, equity: float, exposure: float) -> bool:
         entry_price = sig.snapshot.close
         stop_price = sig.meta["stop_price"]
-        size_krw, why = self.risk.position_size_krw(equity, cash, entry_price, stop_price, exposure)
+        conviction = _conviction(sig, self.cfg.strategy, self.cost)
+        size_krw, why = self.risk.position_size_krw(
+            equity, cash, entry_price, stop_price, exposure, conviction=conviction)
         if size_krw <= 0:
             log.info("[%s] 진입 취소 - %s", market, why)
             return False
@@ -365,6 +418,8 @@ class TradingEngine:
             peak_price=position.peak_price, bars_held=position.bars_held, armed=position.armed,
         )
         sig = strategy.exit_signal(view, snaps)
+        self._record(market, sig.snapshot, "hold" if sig.action != "sell" else "sell",
+                     sig.reason, candles)
         if sig.action != "sell":
             self.store.upsert_position(position)
             log.debug("[%s] %s", market, sig.reason)
@@ -379,6 +434,28 @@ class TradingEngine:
         잊는다. 그 코인은 손절 없이 계좌에 남는다.
         """
         market = position.market
+
+        # 업비트 최소 주문금액은 매도에도 적용된다. 평가액이 그 아래면 주문 자체가
+        # 거부되므로, 시도하고 실패를 반복하는 대신 상태를 명확히 남긴다.
+        value = position.qty * price
+        if not self.risk.sellable(value):
+            if not position.meta.get("dust_notified"):
+                log.error("[%s] 매도 불가 — 평가액 %s원 < 최소주문 %s원. "
+                          "업비트가 주문을 거부합니다. 잔량은 업비트 앱에서 "
+                          "다른 코인과 함께 처리하거나 소액 매도 기능을 쓰세요.",
+                          market, w(value), w(self.cfg.risk.min_order_krw))
+                self.notifier.send("error",
+                                   f"{market} 매도 불가 — 평가액 {w(value)}원이 "
+                                   f"최소주문 {w(self.cfg.risk.min_order_krw)}원 미만. 수동 처리 필요")
+                position.meta["dust_notified"] = True
+            position.meta["dust"] = True
+            self.store.upsert_position(position)
+            return
+
+        if position.meta.pop("dust", None):      # 가격이 회복돼 다시 팔 수 있게 된 경우
+            position.meta.pop("dust_notified", None)
+            log.info("[%s] 평가액 회복 — 매도 재개 가능", market)
+
         log.info("[%s] 매도 시도 - %s", market, reason)
         fill = self.broker.sell(market, position.qty, price)
         self.store.record_order(market, "ask", self.broker.mode,

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
 import webbrowser
@@ -159,6 +160,7 @@ class Handler(BaseHTTPRequestHandler):
     cfg: Config
     db_path: str
     prices: PriceCache
+    engine = None            # `ubbit run` 일 때만 채워진다
 
     def log_message(self, fmt, *args):     # 요청 로그로 콘솔을 덮지 않는다
         return
@@ -179,6 +181,18 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(200, fh.read(), "text/html; charset=utf-8")
             except OSError as exc:
                 self._send(500, str(exc).encode(), "text/plain; charset=utf-8")
+            return
+        if path == "/api/live":
+            engine = getattr(Handler, "engine", None)
+            payload = {
+                "attached": engine is not None,
+                "paused": bool(engine and (engine.paused
+                                           or os.path.exists(self.cfg.engine.kill_switch_file))),
+                "markets": dict(engine.live) if engine else {},
+                "watching": list(engine.markets) if engine else [],
+            }
+            self._send(200, json.dumps(payload, ensure_ascii=False, default=str).encode(),
+                       "application/json; charset=utf-8")
             return
         if path == "/api/state":
             try:
@@ -201,6 +215,9 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             body = {}
         target = bool(body.get("engage"))
+        engine = getattr(Handler, "engine", None)
+        if engine is not None:
+            engine.paused = target
         path = self.cfg.engine.kill_switch_file
         try:
             if target:
@@ -221,18 +238,61 @@ def serve(cfg: Config, db_path: str, host: str, port: int, open_browser: bool = 
     Handler.cfg = cfg
     Handler.db_path = db_path
     Handler.prices = PriceCache()
+    serve_forever(cfg, host, port, open_browser)
 
-    server = ThreadingHTTPServer((host, port), Handler)
+
+def _bind(host: str, port: int, tries: int = 20) -> ThreadingHTTPServer:
+    """포트가 이미 쓰이고 있으면 다음 포트를 찾는다.
+
+    '포트 사용 중'으로 조용히 죽으면 사용자는 창이 안 열리는 이유를 알 수 없다.
+    """
+    last: OSError | None = None
+    for offset in range(tries):
+        try:
+            return ThreadingHTTPServer((host, port + offset), Handler)
+        except OSError as exc:
+            last = exc
+            if exc.errno not in (48, 98):      # EADDRINUSE (mac/linux)
+                raise
+            log.warning("포트 %d 사용 중 — %d 로 재시도", port + offset, port + offset + 1)
+    raise OSError(f"{port}~{port + tries - 1} 범위에 빈 포트가 없습니다: {last}")
+
+
+def _can_open_browser() -> bool:
+    """GUI 가 없는 환경(서버, 일부 WSL, 컨테이너)에서는 브라우저를 띄울 수 없다."""
+    if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
+        if "microsoft" in os.uname().release.lower():
+            return True          # WSL 은 wslview 로 윈도우 브라우저가 열린다
+        return False
+    return True
+
+
+def serve_forever(cfg: Config, host: str, port: int, open_browser: bool = True) -> None:
+    server = _bind(host, port)
+    port = server.server_address[1]
     url = f"http://{'127.0.0.1' if host == '0.0.0.0' else host}:{port}"
-    print("=" * 72)
-    print(f"대시보드: {url}")
-    print(f"  DB: {db_path}   모드: {cfg.mode}")
+    print()
+    print("\u250c" + "\u2500" * 60 + "\u2510")
+    print("\u2502" + f"  브라우저에서 열어주세요".ljust(59) + "\u2502")
+    print("\u2502" + f"     {url}".ljust(59) + "\u2502")
+    print("\u2514" + "\u2500" * 60 + "\u2518")
+    print(f"  DB {Handler.db_path}   모드 {cfg.mode}   종료 Ctrl+C")
     if host not in ("127.0.0.1", "localhost"):
         print("  [경고] 로컬 외부에 열려 있습니다. 잔고와 포지션이 노출됩니다.")
-    print("  종료: Ctrl+C")
-    print("=" * 72)
+    print()
+
     if open_browser:
-        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+        if _can_open_browser():
+            def _open():
+                try:
+                    if not webbrowser.open(url):
+                        print(f"  [안내] 브라우저 자동 실행 실패 — 위 주소를 직접 여세요.")
+                except Exception:                 # noqa: BLE001
+                    print(f"  [안내] 브라우저 자동 실행 실패 — 위 주소를 직접 여세요.")
+            threading.Timer(0.8, _open).start()
+        else:
+            print("  [안내] GUI 가 없는 환경입니다. 위 주소를 직접 여세요.")
+            print("         원격 서버라면: ssh -L {0}:127.0.0.1:{0} <사용자>@<서버>".format(port))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

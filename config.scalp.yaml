@@ -82,6 +82,8 @@ risk:
   reentry_cooldown_minutes: 45
   min_order_krw: 5000
   max_order_krw: 500000
+  dust_guard: 2.0        # 진입 하한 = 5,000 × 2.0 = 10,000원 (매도 불가 포지션 방지)
+  conviction_max: 1.6    # 신호 강도에 따른 사이즈 배수 상한
 
 walk_forward:
   train_bars: 1200

@@ -85,6 +85,22 @@ tbody tr:last-child td{border-bottom:none}
 .note{font-size:12px;color:var(--muted);margin-top:10px;line-height:1.6}
 svg{display:block;width:100%;height:auto}
 .dot{width:7px;height:7px;border-radius:99px;display:inline-block;margin-right:6px}
+.watch{display:grid;gap:10px;grid-template-columns:repeat(2,1fr)}
+@media(max-width:760px){.watch{grid-template-columns:1fr}}
+.w{border:1px solid var(--line);border-radius:10px;padding:11px 12px;min-width:0}
+.w-head{display:flex;align-items:baseline;gap:8px;margin-bottom:2px}
+.w-head b{font-size:13.5px}
+.w-price{margin-left:auto;font-size:13px;font-variant-numeric:tabular-nums}
+.w-reason{font-size:11.5px;color:var(--muted);margin-top:7px;line-height:1.5;
+  word-break:keep-all}
+.w-meta{font-size:11px;color:var(--muted);display:flex;gap:10px;flex-wrap:wrap;
+  margin-top:5px;font-variant-numeric:tabular-nums}
+.rg{font-size:10.5px;padding:2px 7px;border-radius:5px;font-weight:600;
+  border:1px solid transparent}
+.rg.bull{background:rgba(200,55,45,.12);color:var(--up);border-color:rgba(200,55,45,.3)}
+.rg.bear{background:rgba(24,89,196,.12);color:var(--down);border-color:rgba(24,89,196,.3)}
+.rg.dead,.rg.range,.rg.chaos,.rg.unknown{background:var(--line);color:var(--muted)}
+.w-buy{outline:2px solid var(--up);outline-offset:1px}
 .dot.on{background:#16a34a} .dot.off{background:var(--muted)} .dot.warn{background:var(--warn)}
 </style>
 </head>
@@ -140,6 +156,18 @@ svg{display:block;width:100%;height:auto}
           손익분기는 매도가가 매수가 대비 이만큼 올라야 손익 0이 되는 비율이다.
           진입 변동성 하한 아래 구간에서는 봇이 매매하지 않는다.
         </div>
+      </div>
+    </div>
+
+    <div class="card" id="watchCard" style="margin-bottom:12px" hidden>
+      <h2>감시 중 <span id="watchCount" class="tag"></span>
+        <span id="watchStamp" style="float:right;font-weight:400;text-transform:none;
+          letter-spacing:0"></span></h2>
+      <div id="watchGrid" class="watch"></div>
+      <div class="note">
+        봇은 레짐이 <b>상승추세</b>이고 직전 고가를 돌파하며 거래대금이 붙고,
+        그때 목표 순익이 왕복 비용을 넘길 때만 진입한다.
+        <b>기대이동폭 부족</b>은 그 종목이 지금 수수료를 이길 만큼 움직이지 않는다는 뜻이다.
       </div>
     </div>
 
@@ -342,10 +370,82 @@ function render(s) {
   renderChart(s.curve, e.initial);
 }
 
+const REGIME_KO = {
+  bull_trend: '상승추세', bear_trend: '하락추세', range: '횡보',
+  dead: '변동성 부족', chaos: '변동성 과열', unknown: '판단 보류',
+};
+const REGIME_CLS = {bull_trend: 'bull', bear_trend: 'bear'};
+
+function spark(candles, donchian) {
+  if (!candles || candles.length < 2) return '';
+  const W = 320, H = 68, P = 3;
+  const closes = candles.map(c => c.c);
+  const refs = donchian ? [donchian] : [];
+  const lo = Math.min(...closes, ...refs), hi = Math.max(...closes, ...refs);
+  const span = (hi - lo) || 1;
+  const x = i => P + i * (W - 2 * P) / (closes.length - 1);
+  const y = v => H - P - (v - lo) / span * (H - 2 * P);
+  const d = closes.map((v, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join('');
+  const up = closes[closes.length - 1] >= closes[0];
+  const stroke = up ? 'var(--up)' : 'var(--down)';
+  const band = donchian
+    ? `<line x1="${P}" x2="${W - P}" y1="${y(donchian).toFixed(1)}" y2="${y(donchian).toFixed(1)}"
+         stroke="var(--muted)" stroke-width="1" stroke-dasharray="4 3" opacity=".7"/>` : '';
+  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"
+    style="width:100%;height:68px" role="img"
+    aria-label="최근 ${closes.length}봉 가격 추이">
+    ${band}
+    <path d="${d}" fill="none" stroke="${stroke}" stroke-width="1.6"
+      stroke-linejoin="round" stroke-linecap="round"/>
+  </svg>`;
+}
+
+function renderWatch(live) {
+  const card = $('watchCard');
+  if (!live || !live.attached || !Object.keys(live.markets).length) {
+    card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  const entries = Object.entries(live.markets)
+    .sort((a, b) => (b[1].action === 'buy') - (a[1].action === 'buy'));
+  $('watchCount').textContent = `${entries.length}종목`;
+  const newest = entries.map(([, v]) => v.ts).sort().pop();
+  $('watchStamp').innerHTML = newest
+    ? `<span class="mono" style="font-size:11px;color:var(--muted)">마지막 판단 ${newest.slice(11, 19)}</span>` : '';
+
+  $('watchGrid').innerHTML = entries.map(([market, v]) => {
+    const rg = REGIME_CLS[v.regime] || v.regime;
+    const atr = v.atr_pct == null ? null : v.atr_pct;
+    const floorOk = atr != null && v.atr_floor != null && atr >= v.atr_floor;
+    return `
+    <div class="w ${v.action === 'buy' ? 'w-buy' : ''}">
+      <div class="w-head">
+        <b>${market}</b>
+        <span class="rg ${rg}">${REGIME_KO[v.regime] || v.regime}</span>
+        <span class="w-price mono">${won(v.price, v.price < 1000 ? 2 : 0)}</span>
+      </div>
+      ${spark(v.candles, v.donchian_up)}
+      <div class="w-meta">
+        <span>ATR ${atr == null ? '—' : pct(atr, 2)}
+          <b class="${floorOk ? 'up' : 'flat'}">${floorOk ? '충족' : '미달'}</b>
+          <span style="opacity:.7">(하한 ${pct(v.atr_floor, 2)})</span></span>
+        <span>RSI ${v.rsi == null ? '—' : v.rsi.toFixed(0)}</span>
+        <span>거래대금 ×${v.vol_ratio == null ? '—' : v.vol_ratio.toFixed(2)}</span>
+      </div>
+      <div class="w-reason">${v.action === 'buy' ? '<b class="up">진입 신호 · </b>' : ''}${v.reason}</div>
+    </div>`;
+  }).join('');
+}
+
 async function refresh() {
   try {
-    const res = await fetch('/api/state', {cache: 'no-store'});
-    render(await res.json());
+    const [state, live] = await Promise.all([
+      fetch('/api/state', {cache: 'no-store'}).then(r => r.json()),
+      fetch('/api/live', {cache: 'no-store'}).then(r => r.json()).catch(() => null),
+    ]);
+    render(state);
+    renderWatch(live);
   } catch (err) {
     $('stamp').innerHTML = '<span class="dot warn"></span>서버 연결 끊김';
   }
@@ -374,7 +474,7 @@ try {
 } catch (e) {}
 
 refresh();
-setInterval(refresh, 4000);
+setInterval(refresh, 3000);
 </script>
 </body>
 </html>
