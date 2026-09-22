@@ -63,7 +63,10 @@ export async function route(request,env={},fetcher=fetch) {
     body=JSON.stringify(path==='/api/check'?{}:{action:parsed.action,requestId:parsed.requestId,confirm:parsed.confirm||''});
   }
   try {
-    const response=await fetcher(target,{method:request.method,redirect:'error',headers:{Authorization:`Bearer ${env.ENGINE_TOKEN}`,'content-type':'application/json','x-ubbit-actor':request.headers.get('oai-authenticated-user-id')},body,signal:AbortSignal.timeout(path==='/api/check'?20000:8000)});
+    // workerd accepts manual/follow; reject redirects ourselves so credentials
+    // never follow a Location header to another host.
+    const response=await fetcher(target,{method:request.method,redirect:'manual',headers:{Authorization:`Bearer ${env.ENGINE_TOKEN}`,'content-type':'application/json','x-ubbit-actor':request.headers.get('oai-authenticated-user-id')},body,signal:AbortSignal.timeout(path==='/api/check'?20000:8000)});
+    if(response.status>=300&&response.status<400) return json({connected:false,configured:true,error:'엔진 주소가 다른 곳으로 연결됩니다. 등록된 HTTPS 주소를 확인해 주세요.'},502);
     if(!response.ok) return json({connected:false,configured:true,error:response.status===401?'엔진 연결 인증을 확인해 주세요.':response.status===409?'엔진 상태를 확인해 주세요. 연결 점검 후 다시 시도할 수 있습니다.':'엔진이 요청을 처리하지 못했습니다.'},response.status===409?409:502);
     return json(await response.json());
   } catch {return json({connected:false,configured:true,error:'엔진에 연결할 수 없습니다. 마지막 요청의 결과는 확인되지 않았습니다. 새로고침으로 상태를 확인해 주세요.'},502);}

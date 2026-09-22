@@ -1,12 +1,26 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import {route,relayUrl,quotation} from '../worker/index.js';
 const req=(path,body,extra={})=>new Request('https://console.example.com'+path,{headers:{'oai-authenticated-user-id':'owner',...(body?{'content-type':'application/json',origin:'https://console.example.com'}:{}),...extra},...(body?{method:'POST',body:JSON.stringify(body)}:{})});
 test('private data requires authenticated identity',async()=>{const r=await route(new Request('https://console.example.com/api/engine'));assert.equal(r.status,401);});
 test('CSRF blocked before engine request',async()=>{let calls=0;const r=await route(req('/api/control',{action:'resume',requestId:'id'.repeat(12)},{origin:'https://evil.example'}),{},()=>{calls++});assert.equal(r.status,403);assert.equal(calls,0);});
 test('unconfigured engine is not described as connected',async()=>{const r=await route(req('/api/engine'));assert.deepEqual((await r.json()).connected,false);});
 test('relay supports only configured public HTTPS hosts',()=>{for(const u of ['http://example.com','https://127.0.0.1','https://[::1]','https://example.com@localhost','https://user:pass@example.com','https://example.com?token=x'])assert.throws(()=>relayUrl(u));assert.equal(relayUrl('https://engine.example.com'),'https://engine.example.com');});
-test('redirects disabled and secret is server-only',async()=>{let input;const r=await route(req('/api/engine'),{ENGINE_URL:'https://engine.example.com',ENGINE_TOKEN:'secret'},async(url,opts)=>{input={url,opts};return Response.json({connected:true});});assert.equal(input.opts.redirect,'error');assert.equal(input.opts.headers.Authorization,'Bearer secret');assert.equal((await r.json()).connected,true);});
+test('redirects disabled and secret is server-only',async()=>{let input;const r=await route(req('/api/engine'),{ENGINE_URL:'https://engine.example.com',ENGINE_TOKEN:'secret'},async(url,opts)=>{input={url,opts};return Response.json({connected:true});});assert.equal(input.opts.redirect,'manual');assert.equal(input.opts.headers.Authorization,'Bearer secret');assert.equal((await r.json()).connected,true);});
+test('real redirect responses never forward the bridge token',async()=>{
+  let leaked=0,calls=0,status=302;
+  const server=http.createServer((request,response)=>{calls++;if(request.url==='/other'){leaked++;response.end('unexpected');}else{response.writeHead(status,{Location:'/other'});response.end();}});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try{
+    const local=`http://127.0.0.1:${server.address().port}`;
+    for(status of [301,302,303,307,308]){
+      const r=await route(req('/api/engine'),{ENGINE_URL:'https://engine.example.com',ENGINE_TOKEN:'test-secret'},(url,options)=>fetch(local+'/v1/snapshot',options));
+      assert.equal(r.status,502);assert.equal((await r.json()).connected,false);
+    }
+    assert.equal(calls,5);assert.equal(leaked,0);
+  }finally{await new Promise(resolve=>server.close(resolve));}
+});
 test('control timeout never repeats mutation',async()=>{let count=0;const r=await route(req('/api/control',{action:'resume',requestId:'id'.repeat(12)}),{ENGINE_URL:'https://engine.example.com',ENGINE_TOKEN:'secret'},async()=>{count++;throw new Error('timeout')});assert.equal(r.status,502);assert.equal(count,1);});
 test('market validation blocks arbitrary upstream paths',async()=>{await assert.rejects(route(req('/api/candles?market=..%2Faccounts')),/종목/);});
 test('simultaneous quotation reads share upstream fetch',async()=>{let count=0;const fetcher=async()=>{count++;await new Promise(r=>setTimeout(r,10));return Response.json([{ok:true}]);};await Promise.all([quotation('test/singleflight',1000,fetcher),quotation('test/singleflight',1000,fetcher)]);assert.equal(count,1);});
