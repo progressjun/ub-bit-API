@@ -21,7 +21,7 @@ from .dashboard import PriceCache, build_state
 from .engine import TradingEngine
 from .logutil import setup_logging, get_logger
 from .state import Store
-from .upbit import UpbitClient
+from .upbit import UpbitClient, UpbitError
 
 log = get_logger("remote")
 
@@ -58,6 +58,9 @@ class EngineService:
         self.instance = InstanceLock(cfg.engine.db_path + ".lock")
         self.engine = TradingEngine(cfg)
         self.engine.paused = True
+        # Never restore trading authority from disk. Even exits wait for the
+        # operator's explicit live-start action after every process restart.
+        self.armed = not cfg.is_live
         Path(cfg.engine.kill_switch_file).parent.mkdir(parents=True, exist_ok=True)
         Path(cfg.engine.kill_switch_file).touch()
         self.stop_event = threading.Event()
@@ -87,16 +90,23 @@ class EngineService:
                     result = {"ok": False, "message": "실제 수수료와 엔진 설정이 다릅니다. 실행 서버의 비용 설정을 수정해 주세요."}
                 else:
                     result = {"ok": True, "message": "자산·주문 조회와 수수료 확인을 통과했습니다. 주문하기 권한과 실제 체결은 아직 검증되지 않았습니다."}
+            except UpbitError as exc:
+                messages = {
+                    "no_authorization_ip": "현재 PC의 외부 IP를 업비트 API 허용 IP에 등록해 주세요.",
+                    "out_of_scope": "업비트 API의 자산조회·주문조회 권한을 확인해 주세요.",
+                    "expired_access_key": "업비트 API 키가 만료되었습니다. 키를 교체해 주세요.",
+                    "jwt_verification": "업비트 Access Key와 Secret Key 쌍을 확인해 주세요.",
+                }
+                result = {"ok": False, "message": messages.get(exc.name, "업비트 키·허용 IP·조회 권한을 확인해 주세요.")}
             except Exception:
                 result = {"ok": False, "message": "업비트 키·허용 IP·자산조회 및 주문조회 권한을 확인해 주세요."}
         self.checks, self.check_at = result, time.time()
         return result
 
     def start(self):
-        if self.cfg.is_live and not self.check()["ok"]:
-            self.error = "실거래 연결 점검 실패"
-            return
-        if not self.engine.startup_checks():
+        if self.cfg.is_live:
+            self.check()
+        elif not self.engine.startup_checks():
             self.error = self.engine._halted_reason or "잔고 대조 실패"
             return
         self.thread = threading.Thread(target=self._loop, name="ubbit-engine", daemon=True)
@@ -106,11 +116,15 @@ class EngineService:
         while not self.stop_event.is_set() and not self.engine._stop:
             started = time.monotonic()
             try:
-                self.engine.tick()
+                self.evaluate()
                 if self.engine._stop:
                     self.error = self.engine._halted_reason or "엔진 정지"
                     break
                 self.snapshot = build_state(self.cfg, self.cfg.engine.db_path, self.prices)
+                # A live account without an equity sample has no known balance.
+                # Never display the paper seed as real money.
+                if self.cfg.is_live and not self.snapshot.get("curve"):
+                    self.snapshot["equity"] = None
                 self.last_tick = datetime.now(timezone.utc).isoformat()
                 self.last_tick_at = time.time()
                 self.error = ""
@@ -119,12 +133,16 @@ class EngineService:
                 log.exception("Engine evaluation failed")
             self.stop_event.wait(max(1,self.cfg.engine.poll_seconds-(time.monotonic()-started)))
 
+    def evaluate(self):
+        if not self.cfg.is_live or self.armed:
+            self.engine.tick()
+
     def status(self):
         running = bool(self.thread and self.thread.is_alive() and not self.engine._stop)
         stale = not self.last_tick_at or time.time()-self.last_tick_at > max(90,self.cfg.engine.poll_seconds*3)
         state = dict(self.snapshot) if self.snapshot else {"ready": False,"mode": self.cfg.mode}
         state["kill"] = self.engine.paused or os.path.exists(self.cfg.engine.kill_switch_file)
-        return {"connected": True,"running": running,"stale": stale,"last_tick": self.last_tick,
+        return {"connected": True,"running": running,"stale": stale,"last_tick": self.last_tick,"armed": self.armed,
                 "halted_reason": self.error or self.engine._halted_reason,"keys_configured": bool(self.cfg.access_key and self.cfg.secret_key),
                 "checks": self.checks,"state": state,
                 "live": {"watching": list(self.engine.markets),"markets": dict(self.engine.live)}}
@@ -152,8 +170,13 @@ class EngineService:
                         if time.time()-self.check_at>300 or not self.checks or not self.checks["ok"]:
                             if not self.check()["ok"]:
                                 return 409, {"error": "업비트 연결 점검 실패"}
+                        if not self.armed:
+                            self.engine._reconciled = False
+                            if not self.engine.startup_checks():
+                                return 409, {"error": "실제 잔고와 장부 대조가 필요합니다."}
                     Path(self.cfg.engine.kill_switch_file).unlink(missing_ok=True)
                     self.engine.paused = False
+                    self.armed = True
                 else:
                     self.engine.paused = True
                     Path(self.cfg.engine.kill_switch_file).touch()
@@ -223,11 +246,12 @@ def main():
     parser.add_argument("--port",type=int,default=8778)
     parser.add_argument("--host",default="127.0.0.1")
     parser.add_argument("--live",action="store_true")
+    parser.add_argument("--data-dir",default="data")
     args=parser.parse_args()
     cfg=load_config(args.config)
     cfg.mode="live" if args.live else "paper"
-    cfg.engine.db_path="data/sites-live.db" if args.live else "data/sites-paper.db"
-    cfg.engine.kill_switch_file="data/sites-live.KILL" if args.live else "data/sites-paper.KILL"
+    cfg.engine.db_path=str(Path(args.data_dir) / ("sites-live.db" if args.live else "sites-paper.db"))
+    cfg.engine.kill_switch_file=str(Path(args.data_dir) / ("sites-live.KILL" if args.live else "sites-paper.KILL"))
     cfg.engine.halt_on_mismatch=True
     if args.live and (os.environ.get("UBBIT_ALLOW_LIVE") != "1" or not cfg.access_key or not cfg.secret_key):
         parser.error("실거래는 UBBIT_ALLOW_LIVE=1 및 서버의 UPBIT_ACCESS_KEY/UPBIT_SECRET_KEY 설정이 필요합니다.")

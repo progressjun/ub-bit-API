@@ -136,6 +136,40 @@ class RemoteSecurity(unittest.TestCase):
         self.assertEqual(status,409)
         self.assertTrue(self.service.engine.paused)
         self.service.thread=None
+    def test_live_boot_and_failed_confirmation_cannot_evaluate_orders(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg=Config(mode='live',access_key='fake',secret_key='fake',engine=EngineParams(db_path=os.path.join(td,'live.db'),kill_switch_file=os.path.join(td,'kill')))
+            service=EngineService(cfg,'x'*40)
+            try:
+                service.engine.tick=Mock()
+                service.engine.startup_checks=Mock(return_value=True)
+                service.check=Mock(return_value={'ok':False})
+                service.start()
+                service.stop_event.set()
+                service.thread.join(timeout=3)
+                service.evaluate()
+                self.assertFalse(service.armed)
+                service.engine.tick.assert_not_called()
+                service.engine.startup_checks.assert_not_called()
+                self.assertIsNone(service.snapshot['equity'])
+            finally:
+                service.close()
+    def test_successful_live_confirmation_arms_only_after_checks(self):
+        self.service.cfg.mode='live'
+        self.service.armed=False
+        self.service.thread=Mock()
+        self.service.thread.is_alive.return_value=True
+        self.service.last_tick_at=time.time()
+        self.service.checks={'ok':True}
+        self.service.check_at=time.time()
+        self.service.engine.startup_checks=Mock(return_value=False)
+        body={'action':'resume','requestId':'r'*20,'confirm':'실거래 시작'}
+        self.assertEqual(self.service.control(body,'owner')[0],409)
+        self.assertFalse(self.service.armed)
+        self.service.engine.startup_checks.return_value=True
+        self.assertEqual(self.service.control(body,'owner')[0],200)
+        self.assertTrue(self.service.armed)
+        self.service.thread=None
     def test_http_rejects_missing_auth_and_hides_secrets(self):
         class Handler(RemoteHandler):
             service=self.service

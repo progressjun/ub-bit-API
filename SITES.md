@@ -20,7 +20,7 @@
 
 실거래 전환 시 실행 서버 환경에 `UPBIT_ACCESS_KEY`, `UPBIT_SECRET_KEY`, `UBBIT_ALLOW_LIVE=1`을 설정한 뒤 `python -m ubbit.remote --config config.sites.yaml --live`로 시작합니다. Windows는 `./start-sites.ps1 -Live`에서 키를 가려서 입력합니다. 키는 실행 중 프로세스 환경에만 전달됩니다.
 
-실거래 서비스도 **항상 신규 진입 중단 상태**로 시작합니다. 연결 점검 통과 후 Sites에서 `실거래 시작`을 직접 입력해야 진입합니다. 기존 포지션의 자동 청산은 시작 중단 상태에서도 평가합니다. 이미 존재하는 실거래 장부로 서비스를 시작하면 보유분 청산 주문이 발생할 수 있습니다.
+실거래 서비스는 **매수·매도 모두 대기 상태**로 시작합니다. 연결 점검과 잔고 대조 후 Sites에서 `실거래 시작`을 직접 입력해야 주문 평가를 시작합니다. 시작한 뒤 `신규 매수 중단`을 누르면 기존 포지션의 청산은 계속 평가합니다. 프로세스를 재시작하면 다시 전체 주문 대기로 돌아갑니다.
 
 ## 업비트 설정
 
@@ -59,6 +59,24 @@ node scripts/validate-artifact.mjs
 ```
 
 서버 빌드는 `dist/server/index.js`에 UI를 포함한 Worker ESM을 생성합니다. 서버의 기본 내보내기는 `fetch(request, env)`입니다. 배포 파일은 `.openai/hosting.json`과 `dist/server/index.js`만 필요합니다. Python은 엔진 서버에 별도로 실행해야 합니다.
+
+## Windows 백그라운드 실행
+
+전용 가상환경 `.venv`를 사용합니다. `scripts/windows-input.mjs`는 숨긴 표준입력으로 키와 연결 토큰을 받아 `%LOCALAPPDATA%/UBBIT/credentials.dpapi.json`에 Windows DPAPI(CurrentUser)로 암호화합니다. 이 파일과 장부는 Git/OneDrive 밖에 있으며 현재 Windows 사용자만 디렉터리에 접근하도록 ACL을 설정합니다. Sites Secret 저장소와 별도로 PC 엔진이 실행할 때 필요한 로컬 복사본입니다. 브라우저에는 키를 보내지 않습니다.
+
+```powershell
+./scripts/windows-engine.ps1 -Action Status
+./scripts/windows-engine.ps1 -Action Probe
+./scripts/windows-engine.ps1 -Action Start
+./scripts/windows-engine.ps1 -Action Stop
+```
+
+- `Probe`는 IP 및 인증 조회만 수행합니다. `Start`는 백그라운드로 실행하고 모든 실주문을 대기시킵니다.
+- 종료는 기록된 PID와 생성 시각을 함께 확인합니다. 이 실행기가 만든 엔진과 터널만 종료합니다.
+- 장부: `%LOCALAPPDATA%/UBBIT/data/sites-live.db`. 로그: 같은 UBBIT 폴더의 `engine.*.log`, `tunnel.*.log`.
+- PC가 꺼지거나 절전하면 엔진도 중단됩니다. Windows 자동 시작이나 전원 설정은 변경하지 않습니다.
+- 현재 연결은 Cloudflare Quick Tunnel입니다. 개발·연결 점검용 임시 연결이며, 터널 재시작 시 주소가 바뀔 수 있습니다. `Status`의 새 URL을 Sites의 `ENGINE_URL`에 반영하고 재배포해야 합니다. 장기 운용에는 계정에 등록한 고정 터널/도메인이 필요합니다. [Cloudflare 안내](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/)
+- API 점검 실패 시 PC 서비스는 연결을 유지하되, 사용자가 다시 점검을 통과하기 전에는 실거래 시작을 허용하지 않습니다.
 
 ## 근거 문서
 
