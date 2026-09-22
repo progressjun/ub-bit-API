@@ -1,0 +1,26 @@
+[Unit]
+Description=UBBIT Sites engine bridge
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=ubbit
+WorkingDirectory=/opt/ubbit
+EnvironmentFile=/etc/ubbit-bridge.env
+# Add --live only after key/IP/permissions and risk limits have been checked.
+ExecStart=/opt/ubbit/.venv/bin/python -m ubbit.remote --config config.sites.yaml
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=60
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/ubbit/data /opt/ubbit/logs
+
+[Install]
+WantedBy=multi-user.target

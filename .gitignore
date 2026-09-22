@@ -10,3 +10,14 @@ data/candles/
 logs/
 .KILL
 .DS_Store
+dist/
+.site-starter/
+.worker-starter/
+.sites-runtime/
+node_modules/
+.env.*
+!.env.example
+data/
+*.zip
+*.tar.gz
+.sites-test-output.txt

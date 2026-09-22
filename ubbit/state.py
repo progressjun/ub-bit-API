@@ -58,6 +58,18 @@ CREATE TABLE IF NOT EXISTS equity (
     exposure_krw  REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_trades_closed ON trades(closed_at);
+CREATE TABLE IF NOT EXISTS order_intents (
+    identifier TEXT PRIMARY KEY,
+    market TEXT NOT NULL,
+    side TEXT NOT NULL,
+    status TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runtime_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -178,6 +190,21 @@ class Store:
 
     def close(self) -> None:
         self.conn.close()
+
+    def set_runtime(self, key: str, value: Any) -> None:
+        self.conn.execute("INSERT INTO runtime_state(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key,json.dumps(value,default=str)))
+        self.conn.commit()
+
+    def get_runtime(self, key: str, default=None):
+        row = self.conn.execute("SELECT value FROM runtime_state WHERE key=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else default
+
+    def intent(self, identifier: str, market: str, side: str, status: str, detail=None) -> None:
+        self.conn.execute("INSERT INTO order_intents(identifier,market,side,status,detail,created_at) VALUES (?,?,?,?,?,?) ON CONFLICT(identifier) DO UPDATE SET status=excluded.status,detail=excluded.detail", (identifier,market,side,status,json.dumps(detail or {},default=str),datetime.now().isoformat()))
+        self.conn.commit()
+
+    def pending_intents(self) -> list[dict]:
+        return [dict(r) for r in self.conn.execute("SELECT * FROM order_intents WHERE status NOT IN ('applied','rejected')").fetchall()]
 
 
 def _row_to_position(row: sqlite3.Row) -> Position:

@@ -28,6 +28,8 @@ class Fill:
     fee: float
     raw: Any = None
     error: str = ""
+    uncertain: bool = False
+    identifier: str = ""
 
 
 class Broker(ABC):
@@ -98,10 +100,12 @@ class LiveBroker(Broker):
     """
     mode = "live"
 
-    def __init__(self, client: UpbitClient, cost: CostModel, *, fill_timeout: float = 20.0) -> None:
+    def __init__(self, client: UpbitClient, cost: CostModel, *, fill_timeout: float = 20.0, journal=None) -> None:
         self.client = client
         self.cost = cost
         self.fill_timeout = fill_timeout
+        self.journal = journal
+        self.unresolved = False
 
     def balances(self) -> dict[str, float]:
         out: dict[str, float] = {}
@@ -128,22 +132,47 @@ class LiveBroker(Broker):
             return self.cost
 
     def buy(self, market: str, krw_amount: float, ref_price: float) -> Fill:
-        ident = uuid.uuid4().hex[:24]
-        try:
-            resp = self.client.market_buy(market, krw_amount, identifier=ident)
-            detail = self.client.wait_fill(resp["uuid"], timeout=self.fill_timeout)
-        except UpbitError as exc:
-            return Fill(False, market, "bid", 0, 0, 0, 0, error=str(exc))
-        return _fill_from_detail(detail, market, "bid")
+        # Budget includes fee; Upbit market-buy price excludes the fee.
+        return self._execute(market, "bid", krw_amount / (1 + self.cost.fee_buy))
 
     def sell(self, market: str, qty: float, ref_price: float) -> Fill:
+        return self._execute(market, "ask", qty)
+
+    def _execute(self, market: str, side: str, amount: float) -> Fill:
+        if self.unresolved or (self.journal and self.journal.pending_intents()):
+            return Fill(False, market, side, 0, 0, 0, 0, error="미확인 주문 대조 필요", uncertain=True)
         ident = uuid.uuid4().hex[:24]
+        if self.journal:
+            self.journal.intent(ident, market, side, "pending", {"amount": amount})
         try:
-            resp = self.client.market_sell(market, qty, identifier=ident)
+            method = self.client.market_buy if side == "bid" else self.client.market_sell
+            resp = method(market, amount, identifier=ident)
             detail = self.client.wait_fill(resp["uuid"], timeout=self.fill_timeout)
         except UpbitError as exc:
-            return Fill(False, market, "ask", 0, 0, 0, 0, error=str(exc))
-        return _fill_from_detail(detail, market, "ask")
+            # A submission 4xx is a known rejection; a later lookup 4xx is not.
+            if 400 <= exc.status < 500 and 'resp' not in locals():
+                if self.journal:
+                    self.journal.intent(ident, market, side, "rejected", {"error": exc.name})
+                return Fill(False, market, side, 0, 0, 0, 0, error=str(exc), identifier=ident)
+            try:
+                detail = self.client.order_by_identifier(ident)
+            except Exception:
+                detail = {}
+        except Exception:
+            detail = {}
+        if detail.get("state") not in ("done", "cancel"):
+            self.unresolved = True
+            if self.journal:
+                self.journal.intent(ident, market, side, "unknown", detail)
+            return Fill(False, market, side, 0, 0, 0, 0, error="주문 결과 미확인: 자동 주문 정지. 식별자 " + ident, uncertain=True, identifier=ident)
+        fill = _fill_from_detail(detail, market, side)
+        fill.identifier = ident
+        if fill.qty > 0 and fill.price <= 0:
+            self.unresolved = True
+            fill.ok, fill.uncertain, fill.error = False, True, "체결금액 미확인"
+        if self.journal:
+            self.journal.intent(ident, market, side, "unknown" if fill.uncertain else "filled" if fill.ok else "rejected", detail)
+        return fill
 
     def equity(self, prices: dict[str, float]) -> tuple[float, float, float]:
         bal = self.balances()

@@ -252,7 +252,7 @@ def _bind(host: str, port: int, tries: int = 20) -> ThreadingHTTPServer:
             return ThreadingHTTPServer((host, port + offset), Handler)
         except OSError as exc:
             last = exc
-            if exc.errno not in (48, 98):      # EADDRINUSE (mac/linux)
+            if exc.errno not in (48, 98, 10048) and getattr(exc, "winerror", None) != 10048:
                 raise
             log.warning("포트 %d 사용 중 — %d 로 재시도", port + offset, port + offset + 1)
     raise OSError(f"{port}~{port + tries - 1} 범위에 빈 포트가 없습니다: {last}")

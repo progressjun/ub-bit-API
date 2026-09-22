@@ -1,0 +1,11 @@
+{
+  "name": "ubbit-sites-console",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "node scripts/build.mjs",
+    "test": "node --test tests/site.test.mjs",
+    "validate": "node scripts/validate-artifact.mjs"
+  }
+}
