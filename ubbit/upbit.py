@@ -72,15 +72,15 @@ class UpbitClient:
     ) -> Any:
         url = f"{self.base_url}{path}"
         query = encode_query(params)
-        headers: dict[str, str] = {}
-        if private:
-            if not self.has_keys:
-                raise RuntimeError("API 키가 없습니다. UPBIT_ACCESS_KEY / UPBIT_SECRET_KEY 를 설정하세요.")
-            headers.update(auth_header(self.access_key, self.secret_key, params))
+        if private and not self.has_keys:
+            raise RuntimeError("API 키가 없습니다. UPBIT_ACCESS_KEY / UPBIT_SECRET_KEY 를 설정하세요.")
 
         backoff = 0.5
         last_exc: Exception | None = None
-        for attempt in range(1, self.max_retries + 1):
+        attempts = self.max_retries if method == "GET" else 1
+        for attempt in range(1, attempts + 1):
+            # Each attempt needs a new nonce. Mutations are never auto-retried.
+            headers = auth_header(self.access_key, self.secret_key, params) if private else {}
             self.limiter.acquire(group)
             try:
                 if method == "GET":
@@ -90,11 +90,12 @@ class UpbitClient:
                     full = f"{url}?{query}" if query else url
                     resp = self.session.delete(full, headers=headers, timeout=self.timeout)
                 else:  # POST
-                    headers["Content-Type"] = "application/x-www-form-urlencoded"
                     resp = self.session.post(
-                        url, data=query.encode("utf-8"), headers=headers, timeout=self.timeout
+                        url, json=dict(params or {}), headers=headers, timeout=self.timeout
                     )
             except requests.RequestException as exc:  # 네트워크 계층 오류
+                if method != "GET":
+                    raise UpbitError(-1, {"error": {"name": "unknown_result", "message": "주문 결과 미확인. 식별자로 조회해야 합니다."}}, path) from None
                 last_exc = exc
                 log.warning("네트워크 오류 (%s/%s) %s: %s", attempt, self.max_retries, path, exc)
                 time.sleep(backoff)
@@ -102,6 +103,8 @@ class UpbitClient:
                 continue
 
             if resp.status_code in (429, 418):
+                if method != "GET" or resp.status_code == 418:
+                    raise UpbitError(resp.status_code, {"error": {"name": "rate_limit"}}, path)
                 self.limiter.penalize(group, seconds=backoff)
                 log.warning("rate limit %s (%s/%s) %s", resp.status_code, attempt, self.max_retries, path)
                 time.sleep(backoff)
@@ -109,6 +112,8 @@ class UpbitClient:
                 continue
 
             if 500 <= resp.status_code < 600:
+                if method != "GET":
+                    raise UpbitError(resp.status_code, {"error": {"name": "unknown_result"}}, path)
                 log.warning("서버 오류 %s (%s/%s) %s", resp.status_code, attempt, self.max_retries, path)
                 time.sleep(backoff)
                 backoff *= 2
@@ -167,6 +172,9 @@ class UpbitClient:
 
     def order_detail(self, uuid_: str) -> dict:
         return self._request("GET", "/v1/order", params={"uuid": uuid_}, group="default", private=True)
+
+    def order_by_identifier(self, identifier: str) -> dict:
+        return self._request("GET", "/v1/order", params={"identifier": identifier}, private=True)
 
     def place_order(
         self,

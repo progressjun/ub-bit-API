@@ -70,7 +70,7 @@ class TradingEngine:
         self.risk = RiskManager(cfg.risk, self.cost)
         self.store = Store(cfg.engine.db_path)
         self.broker: Broker = (
-            LiveBroker(self.client, self.cost)
+            LiveBroker(self.client, self.cost, journal=self.store)
             if cfg.is_live
             else PaperBroker(self.cost, cfg.engine.initial_krw)
         )
@@ -79,7 +79,7 @@ class TradingEngine:
         self.params_store = ParamStore(cfg.engine.param_file) if cfg.engine.adaptive_params else None
         # 주입 가능한 시계. 실거래는 실제 시각, replay 는 캔들 타임스탬프를 쓴다.
         # 이것이 없으면 재생 중 1200봉이 전부 '같은 날'로 집계돼 일일 한도에 걸린다.
-        self.clock: Callable[[], datetime] = datetime.now
+        self.clock: Callable[[], datetime] = lambda: datetime.now(KST).replace(tzinfo=None)
         self.markets: list[str] = list(cfg.engine.markets)
         self._universe_refreshed_at: float = 0.0
         self.notifier = Notifier(cfg.notify, label=f"ubbit/{cfg.mode}")
@@ -90,6 +90,21 @@ class TradingEngine:
         self.paused = False
         self._reconciled = False
         self._halted_reason = ""
+        # Restore paper cash from the durable trade/position ledger, not the
+        # equity sample recorded before a tick's orders.
+        if isinstance(self.broker, PaperBroker):
+            positions = self.store.all_positions()
+            self.broker.cash = cfg.engine.initial_krw + self.store.performance()["net_pnl"] - sum(p.entry_krw for p in positions)
+            self.broker.holdings = {p.market:p.qty for p in positions}
+        saved = self.store.get_runtime("risk")
+        if saved:
+            from datetime import date
+            rs = self.risk.state
+            rs.day = date.fromisoformat(saved["day"])
+            for key in ("day_start_equity", "realized_pnl_today", "trades_today", "consecutive_losses"):
+                setattr(rs, key, saved[key])
+            rs.paused_until = datetime.fromisoformat(saved["paused_until"]) if saved.get("paused_until") else None
+            rs.last_exit_at = {m:datetime.fromisoformat(t) for m,t in saved.get("last_exit_at",{}).items()}
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
 
@@ -137,6 +152,9 @@ class TradingEngine:
         False 를 반환하면 기동하지 않는다. 사실과 다른 상태를 믿고 도는 것보다
         아예 안 도는 편이 안전하기 때문이다.
         """
+        if self.cfg.is_live and self.store.pending_intents():
+            self._halted_reason = "미확인 주문이 있습니다. 업비트 주문과 장부를 대조해야 합니다."
+            return False
         if self._reconciled or not self.cfg.engine.reconcile_on_start:
             return True
         self._reconciled = True
@@ -250,6 +268,20 @@ class TradingEngine:
 
     # -------------------------------------------------------------------- tick
     def tick(self) -> None:
+        if self.cfg.is_live and self.store.pending_intents():
+            self._halted_reason = "미확인 주문 대조 필요 — 자동 주문 정지"
+            self._stop = True
+            return
+        try:
+            self._tick()
+        finally:
+            self._save_risk()
+
+    def _save_risk(self) -> None:
+        from dataclasses import asdict
+        self.store.set_runtime("risk", asdict(self.risk.state))
+
+    def _tick(self) -> None:
         killed = self.paused or os.path.exists(self.cfg.engine.kill_switch_file)
         session = evaluate_session(self.cfg.session, self._session_now())
 
@@ -289,6 +321,11 @@ class TradingEngine:
             self._manage_position(position, candles)
 
         if killed:
+            for market, candles in candles_by_market.items():
+                if not self.store.get_position(market):
+                    strategy = self.strategy_for(market)
+                    sig = strategy.entry_signal(candles, strategy.compute(candles))
+                    self._record(market, sig.snapshot, "hold", "신규 진입 중단 · " + sig.reason, candles)
             log.warning("킬스위치(%s) 감지 → 신규 진입 차단. 청산 로직만 동작합니다.",
                         self.cfg.engine.kill_switch_file)
             self._log_status(total, cash, exposure, "킬스위치")
@@ -349,6 +386,8 @@ class TradingEngine:
 
     # -------------------------------------------------------------- 포지션 진입
     def _open_position(self, market: str, sig: Signal, cash: float, equity: float, exposure: float) -> bool:
+        if self.paused or self._stop or os.path.exists(self.cfg.engine.kill_switch_file):
+            return False
         entry_price = sig.snapshot.close
         stop_price = sig.meta["stop_price"]
         conviction = _conviction(sig, self.cfg.strategy, self.cost)
@@ -370,6 +409,9 @@ class TradingEngine:
         self.store.record_order(market, "bid", self.broker.mode,
                                 {"krw": size_krw, "ref_price": entry_price}, fill.raw or fill.error)
         if not fill.ok:
+            if fill.uncertain:
+                self._halted_reason = fill.error
+                self._stop = True
             log.error("[%s] 매수 실패: %s", market, fill.error)
             self.notifier.send("error", f"{market} 매수 실패 — {fill.error}")
             return False
@@ -388,6 +430,9 @@ class TradingEngine:
         )
         self.store.upsert_position(position)
         self.risk.record_entry()
+        self._save_risk()
+        if fill.identifier:
+            self.store.intent(fill.identifier, market, "bid", "applied", fill.raw)
         self.notifier.send("entry", f"{market} 매수 {w(fill.krw)}원 @ {w(fill.price, 2)} "
                            f"손절 {w(position.stop_price, 2)} 목표순익 {pct(position.target_net)}")
         log.info("[%s] 매수 체결 단가=%s 수량=%.8f 투입=%s 수수료=%s 손절=%s 목표순익=%s",
@@ -403,8 +448,9 @@ class TradingEngine:
         last_ts = candles[-1].ts
 
         # 봉이 바뀐 경우에만 보유 봉수를 증가시킨다(같은 봉 내 중복 카운트 방지).
-        if self._last_bar_ts.get(market) != last_ts:
+        if position.meta.get("last_bar_ts") != last_ts:
             self._last_bar_ts[market] = last_ts
+            position.meta["last_bar_ts"] = last_ts
             position.bars_held += 1
 
         price = candles[-1].close
@@ -461,25 +507,38 @@ class TradingEngine:
         self.store.record_order(market, "ask", self.broker.mode,
                                 {"qty": position.qty, "ref_price": price}, fill.raw or fill.error)
         if not fill.ok:
-            log.error("[%s] 매도 실패: %s (포지션 유지, 다음 주기 재시도)", market, fill.error)
+            if fill.uncertain:
+                self._halted_reason = fill.error
+                self._stop = True
+            log.error("[%s] 매도 실패: %s (포지션 유지)", market, fill.error)
             self.notifier.send("error", f"{market} 매도 실패 — {fill.error} "
                                f"(포지션 유지, 재시도). 반복되면 직접 확인 필요")
             self.store.upsert_position(position)
             return
 
-        net_pnl = fill.krw - position.entry_krw
-        net_ret = net_pnl / position.entry_krw if position.entry_krw else 0.0
-        entry_fee = position.entry_krw * self.cost.fee_buy / (1 + self.cost.fee_buy)
+        fraction = min(fill.qty / position.qty, 1.0)
+        entry_cost = position.entry_krw * fraction
+        net_pnl = fill.krw - entry_cost
+        net_ret = net_pnl / entry_cost if entry_cost else 0.0
+        entry_fee = entry_cost * self.cost.fee_buy / (1 + self.cost.fee_buy)
         self.store.record_trade(
             market=market, opened_at=position.opened_at,
             closed_at=self.clock().isoformat(timespec="seconds"),
             entry_price=position.entry_price, exit_price=fill.price, qty=fill.qty,
-            entry_krw=position.entry_krw, exit_krw=fill.krw,
+            entry_krw=entry_cost, exit_krw=fill.krw,
             fee_krw=entry_fee + fill.fee, net_pnl=net_pnl, net_return=net_ret,
             exit_kind=exit_kind, reason=reason,
         )
-        self.store.delete_position(market)
+        if position.qty - fill.qty > max(1e-12, position.qty * 1e-8):
+            position.qty -= fill.qty
+            position.entry_krw -= entry_cost
+            self.store.upsert_position(position)
+        else:
+            self.store.delete_position(market)
         self.risk.record_exit(market, net_pnl, self.clock())
+        self._save_risk()
+        if fill.identifier:
+            self.store.intent(fill.identifier, market, "ask", "applied", fill.raw)
         self.notifier.send("exit", f"{market} 매도 {pct(net_ret)} ({w(net_pnl)}원) — {exit_kind}")
         log.info("[%s] 매도 체결 단가=%s 회수=%s 순손익=%s (%s) 수수료합=%s",
                  market, w(fill.price, 2), w(fill.krw), w(net_pnl), pct(net_ret),

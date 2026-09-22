@@ -1,0 +1,31 @@
+# Conservative initial connection profile; edit locally after paper validation.
+mode: paper
+engine:
+  markets: [KRW-BTC, KRW-ETH, KRW-SOL, KRW-XRP]
+  candle_unit: 15
+  candle_count: 200
+  poll_seconds: 20
+  initial_krw: 1000000
+  db_path: data/sites-paper.db
+  kill_switch_file: data/sites-paper.KILL
+  universe_auto: false
+  halt_on_mismatch: true
+session:
+  enabled: false
+cost:
+  fee_buy: 0.0005
+  fee_sell: 0.0005
+  slippage_buy: 0.0008
+  slippage_sell: 0.0008
+strategy:
+  min_net_target: 0.006
+risk:
+  max_order_krw: 10000
+  max_position_pct: 0.10
+  max_total_exposure: 0.20
+  max_concurrent: 2
+  daily_trade_limit: 3
+  daily_loss_limit: 0.02
+  risk_per_trade: 0.002
+  dust_guard: 2.0
+  conviction_max: 1.0
