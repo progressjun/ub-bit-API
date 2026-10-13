@@ -10,3 +10,11 @@ data/candles/
 logs/
 .KILL
 .DS_Store
+# Prevent accidental credential commits
+.env
+.env.*
+!.env.example
+!.env.*.example
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
